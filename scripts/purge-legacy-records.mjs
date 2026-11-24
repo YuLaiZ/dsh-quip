@@ -10,6 +10,11 @@
  *
  * 先备份原文件；重写后再解压读一遍，核对行数与 seq 连续性。
  *
+ * 关键：DSH 的会话日志是**多帧** zstd 文件，第一帧必须恰好只有 session header 那一行。
+ * 所以重写时必须把 header 行和其余内容**分别压成两帧**再拼接；用单次 `zstd -c` 把整个文件
+ * 压成一帧会让 DSH 判读失败（first frame is not exactly one header line），随后该会话
+ * 会被静默跳过并从工作区列表里消失。写完必须校验帧结构，不能只校验行数。
+ *
  * 用法：
  *   node scripts/purge-legacy-records.mjs --dry-run          # 只报告
  *   node scripts/purge-legacy-records.mjs                    # 执行
@@ -43,6 +48,48 @@ const zstd = (cliArgs, input) => {
   const result = spawnSync('zstd', cliArgs, { input, encoding: 'buffer', maxBuffer: 1 << 30 })
   if (result.status !== 0) throw new Error(`zstd ${cliArgs.join(' ')} failed: ${result.stderr.toString()}`)
   return result.stdout
+}
+
+/**
+ * 数一个 zstd 文件里有多少个完整的帧。只按帧头/块头走一遍结构，不解压。
+ * 用来确认重写后仍是「header 独占首帧」的多帧文件。
+ */
+const countZstdFrames = (buffer) => {
+  const ZSTD_MAGIC = 4247762216
+  let offset = 0
+  let frames = 0
+  while (offset < buffer.length) {
+    const start = offset
+    if (buffer.length - offset < 4) throw new Error(`torn zstd frame at byte ${start}`)
+    if (buffer.readUInt32LE(offset) !== ZSTD_MAGIC) throw new Error(`invalid zstd frame magic at byte ${offset}`)
+    offset += 4
+    if (offset === buffer.length) throw new Error(`torn zstd frame at byte ${start}`)
+    const descriptor = buffer.readUInt8(offset)
+    offset += 1
+    if ((descriptor & 24) !== 0) throw new Error(`reserved zstd frame-header bit at byte ${offset - 1}`)
+    const contentSizeFlag = descriptor >>> 6
+    const singleSegment = (descriptor & 32) !== 0
+    const checksum = (descriptor & 4) !== 0
+    const dictionaryFlag = descriptor & 3
+    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
+    const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
+    offset += (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
+    for (;;) {
+      if (buffer.length - offset < 3) throw new Error(`torn zstd frame at byte ${start}`)
+      const blockHeader = buffer.readUIntLE(offset, 3)
+      offset += 3
+      const lastBlock = (blockHeader & 1) !== 0
+      const blockType = (blockHeader >>> 1) & 3
+      const blockSize = blockHeader >>> 3
+      if (blockType === 3) throw new Error(`reserved zstd block type at byte ${offset - 3}`)
+      offset += blockType === 1 ? 1 : blockSize
+      if (lastBlock) break
+    }
+    if (checksum) offset += 4
+    if (offset > buffer.length) throw new Error(`torn zstd frame at byte ${start}`)
+    frames += 1
+  }
+  return frames
 }
 
 const collectLogs = (dir, out) => {
@@ -82,9 +129,18 @@ const purgeLog = (file) => {
 
   copyBackup(file)
   const tmp = `${file}.purge-tmp`
-  const body = Buffer.from(out.join('\n') + (trailingNewline ? '\n' : ''), 'utf8')
-  writeFileSync(tmp, zstd(['-q', '-3', '-c'], body))
-  // 自检：解压回来行数一致，且每个事件的 seq === 行号 - 1（首行是 session header）
+  // 帧 1 = header 行，帧 2 = 其余内容：拆开压缩才能满足 DSH 的首帧约定。
+  const headerLine = out[0]
+  const rest = out.slice(1).join('\n') + (trailingNewline ? '\n' : '')
+  const framed = Buffer.concat([
+    zstd(['-q', '-3', '-c'], Buffer.from(headerLine + '\n', 'utf8')),
+    zstd(['-q', '-3', '-c'], Buffer.from(rest, 'utf8')),
+  ])
+  writeFileSync(tmp, framed)
+  // 自检 1：帧结构必须多帧，且首帧解压后恰好只有 header 一行
+  const frameCount = countZstdFrames(readFileSync(tmp))
+  if (frameCount < 2) throw new Error(`${file}: rebuilt log has ${frameCount} zstd frame(s); DSH requires the header in its own leading frame`)
+  // 自检 2：解压回来行数一致，且每个事件的 seq === 行号 - 1（首行是 session header）
   const verify = zstd(['-dc', tmp]).toString('utf8').split('\n')
   if (verify[verify.length - 1] === '') verify.pop()
   if (verify.length !== lines.length) throw new Error(`${file}: line count changed (${lines.length} → ${verify.length})`)

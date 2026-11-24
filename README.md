@@ -121,7 +121,9 @@ src/styles.js    风格预设（系统提示词 + 兜底池）
 src/quip-lib.js  素材折叠、脱敏、输出清洗
 src/client.js    Client：turnTail 渲染、SSE 订阅、设置卡 + 生成记录面板（含定位命令）
 tests/           host 集成测试（真实走一遍写入器解析）、client jsdom 渲染测试
-scripts/         purge-legacy-records.mjs：清除 0.6.0 之前历史记录的一次性迁移工具
+scripts/         purge-legacy-records.mjs：清除 0.6.0 之前历史记录的一次性迁移工具（写回时保持多帧结构）
+                 repair-zstd-frames.mjs：修复被压成单帧的会话日志，恢复 DSH 可读的帧结构
+                 restore-workspace-membership.mjs：把掉出工作区账本的会话挂回列表
 ```
 
 ```bash
