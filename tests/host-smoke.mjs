@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync } fro
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { apply, pluginRecordOf, candidateSessionModules, probeHostSessionUrl } from '../src/index.js'
+import { apply, pluginRecordOf, isCurrentQuipRecord, textOfRecord, PURGED_RECORD_TYPE, candidateSessionModules, probeHostSessionUrl } from '../src/index.js'
 
 // ---- 临时目录：假 dsh-session 包 + 生成记录目录 ----
 const root = mkdtempSync(join(tmpdir(), 'dsh-quip-test-'))
@@ -31,7 +31,8 @@ writeFileSync(join(fakeSessionDir, 'lib', 'index.js'), [
   'export function appendPluginRecord(session, type, data) {',
   '  calls.push({ session, type, data })',
   '  if (state.mode === "brand") throw new TypeError("Receiver must be an instance of class Session")',
-  '  return 1',
+  '  // 与宿主一致：返回记录的日志 seq（调用次数），插件回填到生成记录里用于定位',
+  '  return calls.length',
   '}',
 ].join('\n'))
 process.env.DSH_INSTALL_DIR = join(scopeDir, 'dsh')
@@ -122,19 +123,31 @@ const ctx = {
   fiber: { entry: { options: { id: 'quip' } } },
 }
 
-// 冷读用的会话日志（plugin record 形态）
+// 冷读用的会话日志。结构完整的当前格式应恢复；其他插件的 record、损坏行、缺 ignorable、
+// 未来版本、清除历史的占位行全部落选。
+const currentRecord = (turn, step, kind, text, pluginExtra = {}) => ({
+  v: 1, turn, step,
+  message: {
+    role: 'assistant', content: [{ type: 'text', text }],
+    source: kind === 'model' ? { kind, provider: 'p', model: 'm' } : { kind },
+    id: `quip-x-${turn}-${step}`,
+  },
+  usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+  request: { provider: 'p', model: 'm', temperature: 1.2 },
+  after: { seq: 1, messageId: 'a', turnEndSeq: 2 },
+  plugin: { name: 'dsh-quip', source: kind === 'model' ? 'model' : 'fallback', outcome: 'ok', ...pluginExtra },
+})
 const coldLogEvents = [
   { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
-  { type: 'plugin:dsh-quip/quip', seq: 2, time: 2000, ignorable: true, data: { v: 1, turn: 1, text: '冷读恢复的第一句', style: 'playful', source: 'model' } },
-  { type: 'plugin:dsh-quip/quip', seq: 3, time: 3000, ignorable: true, data: { turn: 2, text: '冷读恢复的第二句（无 v，视为 1）', style: 'calm', source: 'fallback' } },
-  { type: 'plugin:other/x', seq: 4, time: 4, ignorable: true, data: {} },
-  { type: 'plugin:dsh-quip/quip', seq: 5, time: 5, ignorable: true, data: { broken: true } },
-  { type: 'plugin:dsh-quip/quip', seq: 6, time: 6, data: { turn: 9, text: '没有 ignorable 标记，不算 record' } },
-  { type: 'plugin:dsh-quip/quip', seq: 7, time: 7, ignorable: true, data: { v: 99, turn: 10, text: '未来版本的记录，当前版本跳过' } },
-  // v2：原生形状 + after 锚点；模型生成句
-  { type: 'plugin:dsh-quip/quip', seq: 8, time: 8000, ignorable: true, data: { v: 2, turn: 3, step: 1, attempt: 0, message: { role: 'assistant', content: [{ type: 'text', text: 'v2 格式的模型句' }], source: { kind: 'model', provider: 'p', model: 'm' }, id: 'x' }, usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 }, request: { provider: 'p', model: 'm', temperature: 1.2 }, after: { seq: 1, messageId: 'a', turnEndSeq: 2 }, plugin: { name: 'dsh-quip', source: 'model', outcome: 'ok' } } },
-  // v2：兜底句（kind 是插件自有 producer，不挂模型）
-  { type: 'plugin:dsh-quip/quip', seq: 9, time: 9000, ignorable: true, data: { v: 2, turn: 4, step: 0, attempt: 0, message: { role: 'assistant', content: [{ type: 'text', text: 'v2 格式的兜底句' }], source: { kind: 'dsh-quip' }, id: 'y' }, usage: null, request: { provider: 'p', model: 'm', temperature: 1.2 }, after: { seq: null, messageId: null, turnEndSeq: 5 }, plugin: { name: 'dsh-quip', source: 'fallback', outcome: 'timeout' } } },
+  { type: 'plugin:other/x', seq: 2, time: 2, ignorable: true, data: {} },
+  { type: 'plugin:dsh-quip/quip', seq: 3, time: 3, ignorable: true, data: { broken: true } },
+  { type: 'plugin:dsh-quip/quip', seq: 4, time: 4, data: currentRecord(9, 1, 'model', '没有 ignorable 标记，不算 record') },
+  { type: 'plugin:dsh-quip/quip', seq: 5, time: 5, ignorable: true, data: { ...currentRecord(10, 1, 'model', '未来版本'), v: 99 } },
+  // 清除历史时写入的占位行：内容清空、seq 保留
+  { type: 'plugin:dsh-quip/purged', seq: 6, time: 6, ignorable: true, data: {} },
+  // 当前格式 ×2：模型句 + 兜底句
+  { type: 'plugin:dsh-quip/quip', seq: 7, time: 7000, ignorable: true, data: currentRecord(5, 6, 'model', '当前格式的模型句') },
+  { type: 'plugin:dsh-quip/quip', seq: 8, time: 8000, ignorable: true, data: currentRecord(7, 1, 'dsh-quip', '当前格式的兜底句', { outcome: 'timeout' }) },
 ]
 
 const config = {
@@ -148,6 +161,23 @@ const config = {
   assert.equal(pluginRecordOf({ type: 'plugin:a/b', data: {} }), null, 'missing ignorable → not a record')
   assert.equal(pluginRecordOf({ type: 'turn/end', ignorable: true }), null, 'non-plugin type → not a record')
   assert.equal(pluginRecordOf(null), null)
+}
+// 纯函数：record 判定与文本提取（不依赖宿主模块实例）
+{
+  const current = { type: 'plugin:dsh-quip/quip', ignorable: true, data: currentRecord(1, 2, 'model', '当前格式') }
+  assert.equal(isCurrentQuipRecord(current), true)
+  assert.equal(textOfRecord(current.data), '当前格式')
+  // 结构不完整 / 非当前版本 / 占位行都落选
+  assert.equal(isCurrentQuipRecord({ ...current, data: { ...current.data, v: 99 } }), false, 'future version is not current')
+  assert.equal(isCurrentQuipRecord({ type: PURGED_RECORD_TYPE, ignorable: true, data: {} }), false, 'purged placeholder is not a quip')
+  assert.equal(PURGED_RECORD_TYPE, 'plugin:dsh-quip/purged')
+  assert.equal(isCurrentQuipRecord({ ...current, ignorable: undefined }), false)
+  assert.equal(isCurrentQuipRecord({ ...current, data: { ...current.data, turn: undefined } }), false)
+  assert.equal(isCurrentQuipRecord({ ...current, data: { ...current.data, message: { content: 'not-an-array' } } }), false)
+  assert.equal(isCurrentQuipRecord(null), false)
+  // textOfRecord 只读 message.content 的 text 块
+  assert.equal(textOfRecord({ text: '扁平文本' }), '', 'flat text field is not read')
+  assert.equal(textOfRecord({ message: { content: [{ type: 'tool-call' }, { type: 'text', text: 'a' }, { type: 'text', text: 'b' }] } }), 'ab')
   const candidates = candidateSessionModules()
   assert.ok(candidates.length >= 1, 'DSH_INSTALL_DIR yields at least one candidate')
   assert.ok(candidates.some((c) => c.label === 'host-resolve'), 'first candidate uses standard resolution')
@@ -222,12 +252,12 @@ assert.deepEqual(fakeSession.calls[0].data.usage, { inputTokens: 321, outputToke
     ['after', 'message', 'plugin', 'request', 'step', 'turn', 'usage', 'v'].sort(),
     'record data mirrors the native assistant/message shape plus the after anchor',
   )
-  assert.equal(data.v, 4)
+  assert.equal(data.v, 1, 'record format v1')
   // turn/step：quip 挂在本轮最后一步之后——step = 最后一个 step/end（2）+ 1，
   // 占一个主对话永远不会用到的虚拟步，(1, 3) 与本轮任何 assistant/message 都不同槽
   assert.equal(data.turn, 1)
   assert.equal(data.step, 3, 'step is the last step/end of the turn + 1')
-  // v4：没有 attempt。DSH 原生事件没这个字段，quip 不重试；token-usage 的 attempt 是它自己数出来的
+  // 没有 attempt。DSH 原生事件没这个字段，quip 不重试；token-usage 的 attempt 是它自己数出来的
   assert.equal('attempt' in data, false, 'no attempt field: DSH has none, quip never retries')
   assert.ok(data.message.id.includes('-1-3-'), 'message id embeds the quip step: ' + data.message.id)
   // message：原生消息体（role/content/source/id）。模型生成 → kind=model 且带 provider/model
@@ -302,21 +332,21 @@ assert.deepEqual(fakeSession.calls[0].data.usage, { inputTokens: 321, outputToke
   assert.ok(record.systemPrompt.includes('俏皮'))
 }
 
-// 冷读恢复
+// 冷读恢复：只认当前格式（v === 1 且带 message.content）
 {
   const res = makeRes()
   await routes.get('/api/quip/v1/quips').handler({ url: '/api/quip/v1/quips?session=session-cold-1' }, res)
   const body = JSON.parse(res.body)
-  // v1（扁平）×2 + v2（原生形状）×2；broken / 非 ignorable / 未来版本（v99）跳过
-  assert.equal(body.quips.length, 4, 'v1 and v2 records restored; broken, non-ignorable and future-version skipped')
-  assert.equal(body.quips[0].text, '冷读恢复的第一句')
-  assert.equal(body.quips[1].source, 'fallback', 'v1 flat source still read')
-  assert.equal(body.quips[2].text, 'v2 格式的模型句', 'v2 model line restored from message.content')
-  assert.equal(body.quips[2].source, 'model')
-  assert.equal(body.quips[3].text, 'v2 格式的兜底句', 'v2 fallback line restored')
-  assert.equal(body.quips[3].source, 'fallback')
-  assert.equal(body.quips[3].message.source.kind, 'dsh-quip', 'v2 fallback keeps its producer kind through cold read')
-  assert.deepEqual(body.quips[3].after, { seq: null, messageId: null, turnEndSeq: 5 }, 'after anchor survives cold read')
+  // 夹具里 7 条 plugin:dsh-quip/* 只有 2 条结构完整；purged 占位行、broken、非 ignorable、
+  // 未来版本（v99）全部跳过
+  assert.equal(body.quips.length, 2, 'only structurally complete records restored')
+  assert.equal(body.quips[0].text, '当前格式的模型句')
+  assert.equal(body.quips[0].source, 'model')
+  assert.equal(body.quips[1].text, '当前格式的兜底句')
+  assert.equal(body.quips[1].source, 'fallback')
+  assert.equal(body.quips[1].message.source.kind, 'dsh-quip', 'fallback keeps its producer kind through cold read')
+  assert.deepEqual(body.quips[1].after, { seq: 1, messageId: 'a', turnEndSeq: 2 }, 'after anchor survives cold read')
+  assert.equal(body.quips[1].time, 8000, 'time comes from the outer event envelope')
 }
 
 // status 匿名；返回配置 + 每个模型的思考等级元数据（设置卡下拉用）
@@ -599,9 +629,31 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
 // ---- 生成记录落盘 ----
 {
   const file = readFileSync(join(process.env.QUIP_DATA_DIR, 'generations.jsonl'), 'utf8')
+  const lines = file.split('\n').filter(Boolean)
   // 触发生成的轮次：1 2(brand-fail) 3(sse) 6(llm-fail) 7(timeout) 8 9 10 11(empty) 12(finish-error)
   // 13 14 15(跟随/固定路由) 20(step+1) = 14 条
-  assert.equal(file.split('\n').filter(Boolean).length, 14, 'one generation record per attempted turn')
+  assert.equal(lines.length, 14, 'one generation record per attempted turn')
+  const traces = lines.map((line) => JSON.parse(line))
+  // 文件按追加顺序，第一条是 turn 1
+  const first = traces[0]
+  assert.equal(first.turn, 1)
+  // 定位坐标：recordSeq 是 appendPluginRecord 返回的日志 seq（fake 包返回调用次数 → 1）；
+  // step / messageId / afterSeq / turnEndSeq 与写进会话日志的 record 一致，面板据此定位到那一行
+  assert.equal(first.recordSeq, 1, 'recordSeq is the seq returned by appendPluginRecord')
+  const rec1 = fakeSession.calls[0].data
+  assert.equal(first.step, rec1.step)
+  assert.equal(first.messageId, rec1.message.id)
+  assert.equal(first.afterSeq, rec1.after.seq)
+  assert.equal(first.turnEndSeq, rec1.after.turnEndSeq)
+  for (const trace of traces) {
+    assert.deepEqual(
+      ['afterSeq', 'messageId', 'recordSeq', 'step', 'turnEndSeq'].filter((key) => !(key in trace)),
+      [], `every trace carries the locate coordinates: ${JSON.stringify(Object.keys(trace))}`)
+  }
+  // 写入失败（turn 2 品牌检查失败）的记录：recordSeq 为 null，但 step / messageId 仍在
+  const brandFail = traces.find((trace) => trace.turn === 2)
+  assert.equal(brandFail.recordSeq, null, 'failed persist leaves recordSeq null')
+  assert.equal(typeof brandFail.messageId, 'string', 'messageId is still recorded when persist fails')
 }
 
 console.log('host mock integration smoke: ALL OK')

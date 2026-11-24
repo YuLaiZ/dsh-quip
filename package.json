@@ -1,6 +1,6 @@
 {
   "name": "@yulaiz/dsh-quip",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Quip footer for DeepSeek Harness: after each completed reply, an independent registered-model call writes one line of self-review shown at the turn tail; persisted into the session log as a plugin record. / DeepSeek Harness 俏皮话插件：每轮回复完成后，用独立已注册模型生成一句拟人自评小字，渲染在该轮末尾；以 plugin record 写入会话日志持久化。",
   "keywords": [
     "deepseek-harness",

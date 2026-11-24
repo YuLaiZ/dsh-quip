@@ -58,23 +58,28 @@ const PLUGIN_TAG = 'dsh-quip'
 /** 会话日志里的 record 类型。`plugin:` 前缀 + 全小写段语法，带 `ignorable` 标记。 */
 const RECORD_TYPE = 'plugin:dsh-quip/quip'
 /**
- * plugin record 的 `data` 格式版本。读回时缺失视为 1；只跳过比当前更新的版本，
- * 旧版本按各自的结构解释而不是静默降级。
- * - v1：扁平 {turn, step, attempt, message, usage, request, plugin}；兜底句的
- *   `message.source.kind` 也写成 `model`（失真），没有 `after` 锚点。
- * - v2：新增 `after`（指向所评论的那条 assistant/message）；兜底句的
- *   `message.source.kind` 改为插件自有 producer kind，不再冒充模型生成；
- *   `plugin.outcome` 记录模型调用的结局；`request` 不再有 maxTokens。
- *   v2 的 `step` 取本轮最后一步，与同一步的主对话 assistant/message 同槽——按
- *   token-usage 的 `sessionID:turn:step:attempt` 合成 ID 会撞车。
- * - v3：`step` 改为本轮最后一步 **+ 1**（quip 挂在最后一步之后，占一个 DSH 循环
- *   永远不会走到的虚拟步，与任何主对话消息都不同槽）。结构其余部分与 v2 相同。
- * - v4：**删掉 `attempt`**。DSH 原生事件没有这个字段（`assistant/message.data` 是
- *   `{turn, step, message, …}`），quip 也不重试，它恒为 0、没有信息量；token-usage 的
- *   attempt 是它自己从 `llm/retry-started` 数出来的，不从 record 读。保留只会暗示
- *   一个不存在的重试概念，还让 record 偏离它声称对齐的原生形状。
+ * plugin record 的 `data` 格式版本。当前为 1。
+ *
+ * 0.6.0 是一次清零：此前的记录格式与全部历史数据一并作废、从会话日志清除，版本号从 1 重新计起。
+ * 冷读只认 `v === 1` 且结构完整的记录；清除历史时写入的 {@link PURGED_RECORD_TYPE} 占位行 type 不同，自然落选。
+ *
+ * 结构（与 DSH 原生 `assistant/message.data` 同构）：
+ *   { v, turn, step, message, usage, request, after, plugin }
+ * - step = 本轮最后一个 step/end + 1：quip 在 turn/end 后才生成，挂在最后一步之后，占一个
+ *   DSH 循环永远不会走到的虚拟步，(turn, step) 不与本轮任何 assistant/message 同槽
+ * - message.source.kind 说的是「谁产生了这句话」：模型生成 → model（带 provider/model）；
+ *   兜底句 → 插件自有 producer kind（见 FALLBACK_SOURCE_KIND），不挂任何模型归属
+ * - after = { seq, messageId, turnEndSeq }：钉回所评论的那条 assistant/message 与 turn/end
+ * - plugin = { name, purpose, style, source, outcome, routeSource, durationMs }：source 标文本
+ *   来源（model / fallback / no-provider），outcome 标模型调用的结局（ok / empty / timeout /
+ *   aborted / error / no-provider），「调了但失败→兜底」与「没调→兜底」在日志里可分辨
  */
-const RECORD_FORMAT_VERSION = 4
+const RECORD_FORMAT_VERSION = 1
+/**
+ * 清除历史 record 时写入的占位 type：内容清空，外层 seq / time 原样保留。
+ * 仍是本插件命名空间下的合法 plugin record type，带 `ignorable`，任何读者都安全跳过。
+ */
+export const PURGED_RECORD_TYPE = 'plugin:dsh-quip/purged'
 /**
  * 兜底句的 producer kind。`MessageSourceMap` 是 merge-extensible 的（session v4 起没有
  * catch-all 的 `plugin` kind），每个 producer 自有一个 kind——dsh-rewind 的 marker 用
@@ -107,7 +112,7 @@ const DATA_DIR = process.env.QUIP_DATA_DIR
   ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'quip')
 const GEN_FILE = join(DATA_DIR, 'generations.jsonl')
 /** 本包版本（health 端点与日志用；与 package.json 同步）。 */
-const VERSION = '0.5.1'
+const VERSION = '0.6.0'
 
 // ---- 会话日志 plugin record ----
 
@@ -126,24 +131,38 @@ export function pluginRecordOf(event) {
 }
 
 /**
- * 从一条 record 取出可见文本：优先原生 `message.content` 的 text 块，
- * 兼容早期扁平结构的 `text` 字段。
+ * 从一条 record 取出可见文本：原生 `message.content` 里的 text 块。
  * @param {Record<string, unknown>} record - plugin record 的 data。
  * @returns {string}
  */
 export function textOfRecord(record) {
   if (record === null || typeof record !== 'object') return ''
   const content = record.message?.content
-  if (Array.isArray(content)) {
-    let out = ''
-    for (const block of content) {
-      if (block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') {
-        out += block.text
-      }
+  if (!Array.isArray(content)) return ''
+  let out = ''
+  for (const block of content) {
+    if (block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') {
+      out += block.text
     }
-    if (out !== '') return out
   }
-  return typeof record.text === 'string' ? record.text : ''
+  return out
+}
+
+/**
+ * 纯函数：一个会话事件是否为一条俏皮话 record——类型对、带 `ignorable`、`v` 是当前版本、
+ * `turn` 是数字、`message.content` 是数组。结构不完整的（清除占位行、损坏行、未来版本）落选。
+ * 不触碰任何类，不依赖宿主模块实例。
+ * @param {{ type?: unknown, ignorable?: unknown, seq?: unknown, time?: unknown, data?: unknown } | null | undefined} event - 会话事件。
+ * @returns {boolean}
+ */
+export function isCurrentQuipRecord(event) {
+  if (event === null || typeof event !== 'object') return false
+  if (event.type !== RECORD_TYPE || event.ignorable !== true) return false
+  const data = event.data
+  if (data === null || typeof data !== 'object') return false
+  return data.v === RECORD_FORMAT_VERSION
+    && typeof data.turn === 'number'
+    && Array.isArray(data.message?.content)
 }
 
 /**
@@ -624,22 +643,25 @@ export function apply(ctx, config) {
    * 失败不抛：计数 + 记录 + warn，俏皮话本身已进内存与 SSE。
    * @param {object} session - 宿主 Session 实例。
    * @param {Record<string, unknown>} record - 要写进会话日志的 record data。
+   * @returns {Promise<number | null>} record 在会话日志里的 seq（定位到那一行的坐标）；写入器缺失或失败为 null。
    */
   async function persistQuip(session, record) {
     const writer = await ensureWriter(session)
     if (writer.append === null) {
       persistence.failed += 1
       persistence.lastError = { name: 'NO_WRITER', message: 'no dsh-session module available', stack: null }
-      return
+      return null
     }
     try {
-      writer.append(session, RECORD_TYPE, record)
+      const seq = writer.append(session, RECORD_TYPE, record)
       persistence.appended += 1
+      return typeof seq === 'number' ? seq : null
     } catch (error) {
       persistence.failed += 1
       persistence.lastError = describeError(error)
       ctx.logger.warn(`${PLUGIN_TAG}: plugin record append failed (%s: %s) — quip kept in memory only: %s`,
         persistence.lastError.name, persistence.lastError.message, persistence.lastError.stack ?? '')
+      return null
     }
   }
 
@@ -652,6 +674,7 @@ export function apply(ctx, config) {
    * 两种来源下都有值可读。
    * @param {object} session - 宿主 Session 实例。
    * @param {Record<string, unknown>} record - 要写进会话日志的 record data。
+   * @returns {Promise<number | null>} 写入完成后的 record seq（见 {@link persistQuip}）。
    */
   function pushQuip(session, record) {
     const sessionId = session.id
@@ -672,10 +695,11 @@ export function apply(ctx, config) {
     const limit = Math.max(4, Math.round(currentConfig(config).historyPerSession) || 32)
     while (list.length > limit) list.shift()
     broadcast(sessionId, entry)
-    void persistQuip(session, record)
+    // 调用方 await 它拿到 seq 写进生成记录；内存与 SSE 已推送，不依赖写入成败
+    const persisted = persistQuip(session, record)
     ctx.logger.debug(`${PLUGIN_TAG}: session %s turn %s quip "%s"`, sessionId, record.turn, record.text)
+    return persisted
   }
-
   /**
    * 从会话日志恢复一个会话的俏皮话（冷读：readSession 扫 plugin record）。
    * @returns {Promise<Array<Record<string, unknown>>>} 恢复的列表（可能为空）。
@@ -688,25 +712,17 @@ export function apply(ctx, config) {
       const events = Array.isArray(snapshot?.events) ? snapshot.events : []
       const restored = []
       for (const event of events) {
-        const record = pluginRecordOf(event)
-        if (record === null || record.type !== RECORD_TYPE) continue
-        const data = record.data
-        if (data === null || typeof data !== 'object') continue
-        const version = data.v === undefined ? 1 : data.v
-        // 只跳过比当前更新的格式（读不懂的未来版本）；v1 及当前版本都能冷读
-        if (typeof version !== 'number' || version > RECORD_FORMAT_VERSION) continue
-        if (typeof data.turn !== 'number') continue
-        // 文本优先取原生 message.content 的 text 块，兼容早期扁平 text
+        // 结构不完整的落选：清除占位行、损坏行、未来版本
+        if (!isCurrentQuipRecord(event)) continue
+        const data = event.data
         const text = textOfRecord(data)
         if (text === '') continue
-        // 时间来自外层 event.time（DSH 写入时填），data 里不冗余存。
-        // source：v2 在 plugin.source；v1 扁平格式在顶层 source（曾漏读，冷读后来源丢失）
-        const flatSource = typeof data.source === 'string' && data.source !== '' ? data.source : null
+        // 时间来自外层 event.time（DSH 写入时填），data 里不冗余存
         restored.push({
           ...data,
           text,
-          source: data.plugin?.source ?? flatSource,
-          time: record.time,
+          source: data.plugin?.source ?? null,
+          time: event.time,
         })
       }
       return restored
@@ -820,11 +836,21 @@ export function apply(ctx, config) {
       : await resolveReasoningEffort(route, conf.reasoningEffort)
     const systemPrompt = buildSystemPrompt(conf.style, conf.customPrompt, { maxChars: conf.maxChars })
     const materialText = renderMaterial(material, { includeReasoning: conf.includeReasoning })
+    /** 会话日志写入的 promise：拿到 seq 后回填 trace.recordSeq，再落生成记录。 */
+    let persisted = null
     /** 生成过程记录（成功与失败都记；恢复查看器用）。 */
     const trace = {
       ts: startedAt,
       session: sessionId,
       turn: material.turn,
+      // 会话日志定位坐标。step / messageId 在写 record 前确定；recordSeq 由 appendPluginRecord
+      // 的返回值回填（写入失败则为 null）。有 recordSeq 就能在会话文件里按 seq 直接命中那一行；
+      // 没有（写入失败）时仍可按 turn 找——每轮只写一条 record。
+      step: null,
+      messageId: null,
+      recordSeq: null,
+      afterSeq: material.lastAssistantSeq,
+      turnEndSeq: material.turnEndSeq,
       style: conf.style,
       // 对齐 DSH request/header.header.config（LlmCallConfig）
       provider: route?.provider ?? null,
@@ -942,7 +968,9 @@ export function apply(ctx, config) {
         const quipStep = material.step + 1
         const messageId = `quip-${sessionId}-${material.turn}-${quipStep}-${Date.now().toString(36)}`
         const modelGenerated = source === 'model'
-        pushQuip(session, {
+        trace.step = quipStep
+        trace.messageId = messageId
+        persisted = pushQuip(session, {
           v: RECORD_FORMAT_VERSION,
           turn: material.turn,
           step: quipStep,
@@ -983,6 +1011,9 @@ export function apply(ctx, config) {
       }
     } finally {
       if (trace.durationMs === 0) trace.durationMs = Date.now() - startedAt
+      // 等 record 真正落进会话日志、拿到 seq 再记生成过程：面板靠 recordSeq 定位到会话文件的那一行。
+      // persistQuip 自己吞错并返回 null，这里的 await 只会等到「成功 seq」或「null」。
+      if (persisted !== null) trace.recordSeq = await persisted
       recordGeneration(trace)
       clearTimeout(timer)
       generating.delete(token)

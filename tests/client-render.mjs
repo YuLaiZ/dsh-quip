@@ -51,6 +51,8 @@ globalThis.fetch = dom.window.fetch = async (url) => {
       json: async () => ({
         generations: [{
           ts: Date.now(), session: 's1', turn: 1, style: 'playful',
+          // 会话日志定位坐标（host 在 record 落盘后回填）
+          step: 8, messageId: 'quip-s1-1-8-abc', recordSeq: 105, afterSeq: 102, turnEndSeq: 104,
           provider: 'zai-coding-cn', model: 'glm-5.3-flash',
           material: '素材正文', systemPrompt: '系统提示词', raw: '原始输出',
           cleaned: '（叉腰）稳了', source: 'model',
@@ -299,6 +301,24 @@ assert.notEqual(tailEntry.options.id, settingsEntry.options.id, 'tail and settin
   await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
   const detail = container.innerHTML
   assert.ok(detail.includes('素材正文') || detail.includes('原始输出'), 'record detail expanded')
+
+  // 会话日志定位：详情列出 turn / seq / step / message.id / after 锚点，并给出可复制的定位命令
+  const locate = container.querySelector('.qp-gen-locate')
+  assert.ok(locate !== null, 'locate block rendered for a record with a session')
+  const command = locate.querySelector('.qp-gen-cmd').textContent
+  assert.ok(command.includes("-name 's1'"), 'locate command finds the session directory: ' + command)
+  assert.ok(command.includes('.seq==105'), 'locate command hits the exact record seq: ' + command)
+  assert.ok(command.includes('zstd -dc'), 'locate command decodes the zstd log')
+  const copyBtn = locate.querySelector('button[data-copy]')
+  assert.ok(copyBtn !== null, 'copy button exists')
+  assert.ok(/复制|Copy/.test(copyBtn.textContent), 'copy button is labelled: ' + copyBtn.textContent)
+  const detailText = container.querySelector('.qp-gen-detail').textContent
+  for (const expected of ['1', '105', '8', 'quip-s1-1-8-abc', '102']) {
+    assert.ok(detailText.includes(expected), 'detail shows locate coordinate ' + expected)
+  }
+  // jsdom 没有 clipboard：点复制应落到「复制失败，请手动选中复制」而不是抛错
+  await actFn(async () => { copyBtn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  assert.ok(/复制失败|Copy failed/.test(container.querySelector('.qp-gen-locate button').textContent), 'missing clipboard degrades to a hint')
   root.unmount()
 }
 

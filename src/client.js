@@ -77,6 +77,15 @@ window.__ModuleLoader__.load({
         genUsage: 'token 计量',
         genError: '错误',
         genShowMore: '载入更多',
+        genTurnLabel: '轮次',
+        genSeq: '会话日志 seq',
+        genStep: '虚拟步 step',
+        genMsgId: 'message.id',
+        genAfterSeq: '所评论回复的 seq',
+        genNotPersisted: '未写入会话日志',
+        genLocate: '复制定位命令',
+        genCopied: '已复制',
+        genCopyFailed: '复制失败，请手动选中复制',
       },
       en: {
         settingsNav: 'Quip footer',
@@ -117,6 +126,15 @@ window.__ModuleLoader__.load({
         genUsage: 'Token usage',
         genError: 'Error',
         genShowMore: 'Load more',
+        genTurnLabel: 'Turn',
+        genSeq: 'Session log seq',
+        genStep: 'Virtual step',
+        genMsgId: 'message.id',
+        genAfterSeq: 'seq of the reviewed reply',
+        genNotPersisted: 'not persisted',
+        genLocate: 'Copy locate command',
+        genCopied: 'Copied',
+        genCopyFailed: 'Copy failed; select and copy manually',
       },
     }
 
@@ -229,6 +247,10 @@ window.__ModuleLoader__.load({
       'background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);',
       'font-size:12px;line-height:18px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto}',
       '.qp-gen-more{display:flex;justify-content:center;padding:4px 0 8px}',
+      '.qp-gen-locate{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}',
+      '.qp-gen-cmd{flex:1 1 240px;min-width:0;margin:0;padding:6px 10px;border-radius:var(--dsw-radius-sm);',
+      'background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);',
+      'font-size:11px;line-height:16px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}',
     ].join('')
 
     // ---- 每会话数据 store ----
@@ -493,6 +515,23 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 一条生成记录 → 会话文件里那一行的定位命令（zstd + jq）。
+     * 有 recordSeq 时按 seq 精确命中；写入失败没有 seq 时按 turn 兜底（每轮只写一条 record）。
+     * @param {Record<string, any>} record - 生成记录。
+     * @returns {string} 命令文本；缺 session 时为空串。
+     */
+    function locateCommandOf(record) {
+      const session = String(record?.session ?? '')
+      if (session === '') return ''
+      const seq = record.recordSeq
+      const filter = Number.isInteger(seq)
+        ? `.seq==${seq}`
+        : `.type=="plugin:dsh-quip/quip" and .data.turn==${Number(record.turn)}`
+      return `f=$(find ~/.dsh/sessions -type d -name '${session}' -exec find {} -name 'session.v*.jsonl.zstd' \\;); `
+        + `zstd -dc "$f" | jq 'select(${filter})'`
+    }
+
+    /**
      * 生成记录面板：每次生成的素材、提示词、原始输出、token 计量与成败。
      * 折叠时零请求；展开后按需分页。
      */
@@ -502,6 +541,8 @@ window.__ModuleLoader__.load({
       const [failed, setFailed] = React.useState(false)
       const [limit, setLimit] = React.useState(20)
       const [expanded, setExpanded] = React.useState('')
+      /** 复制定位命令后的按钮态：`${key}:ok` 已复制 / `${key}:fail` 复制失败；空串为空闲。 */
+      const [copyState, setCopyState] = React.useState('')
 
       const reload = React.useCallback((nextLimit) => {
         setFailed(false)
@@ -523,6 +564,20 @@ window.__ModuleLoader__.load({
         reload(next)
       }
 
+      const onCopyLocate = (key, command) => {
+        const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : undefined
+        if (clipboard === undefined || typeof clipboard.writeText !== 'function') {
+          setCopyState(`${key}:fail`)
+          return
+        }
+        clipboard.writeText(command)
+          .then(() => {
+            setCopyState(`${key}:ok`)
+            setTimeout(() => { setCopyState('') }, 1500)
+          })
+          .catch(() => setCopyState(`${key}:fail`))
+      }
+
       const itemOf = (record) => {
         const key = `${record.ts}:${record.turn}`
         const usage = record.usage
@@ -534,6 +589,8 @@ window.__ModuleLoader__.load({
           metaBits.push(tr('genDuration', { ms: record.durationMs }))
         }
         const isOpen = expanded === key
+        const command = locateCommandOf(record)
+        const buttonState = copyState === `${key}:ok` ? 'ok' : copyState === `${key}:fail` ? 'fail' : ''
         return h('div', { className: 'qp-gen-item', key },
           h('button', {
             type: 'button', className: 'qp-gen-row', 'aria-expanded': isOpen ? 'true' : 'false',
@@ -549,6 +606,12 @@ window.__ModuleLoader__.load({
             h('span', { className: 'qp-gen-text' }, String(record.cleaned ?? record.raw ?? record.error ?? '')),
             metaBits.length > 0 ? h('span', { className: 'qp-gen-meta' }, metaBits.join(' · ')) : null),
           isOpen ? h('dl', { className: 'qp-gen-detail' },
+            // 会话日志定位坐标：有 seq 就能直接命中会话文件里那一行
+            genDetailEntry(tr('genTurnLabel'), record.turn),
+            genDetailEntry(tr('genSeq'), record.recordSeq ?? tr('genNotPersisted')),
+            genDetailEntry(tr('genStep'), record.step),
+            genDetailEntry(tr('genMsgId'), record.messageId),
+            genDetailEntry(tr('genAfterSeq'), record.afterSeq),
             genDetailEntry(tr('genResult'), record.cleaned),
             genDetailEntry(tr('genRaw'), record.raw),
             genDetailEntry(tr('genMaterial'), record.material),
@@ -556,7 +619,15 @@ window.__ModuleLoader__.load({
             genDetailEntry(tr('genUsage'), record.usage),
             genDetailEntry(tr('genError'), record.error),
             genDetailEntry('session', record.session),
-          ) : null)
+            command !== ''
+              ? h('div', { className: 'qp-gen-locate' },
+                h('code', { className: 'qp-gen-cmd' }, command),
+                h('button', {
+                  type: 'button', className: 'qp-btn', 'data-copy': buttonState,
+                  onClick: () => { onCopyLocate(key, command) },
+                }, buttonState === 'ok' ? tr('genCopied') : buttonState === 'fail' ? tr('genCopyFailed') : tr('genLocate')))
+              : null)
+          : null)
       }
 
       return h('div', { className: 'qp-card' },
