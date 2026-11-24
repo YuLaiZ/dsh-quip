@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Quip footer（俏皮话）",
+    "description": "每轮回复完成后，用一次独立的已注册模型调用生成一句拟人语气自评，作为小字渲染在该轮回复末尾；以 plugin record 写入会话日志，重启后恢复、随 fork/导出携带；支持俏皮、夸夸、毒舌自嘲、冷静自评与自定义风格，模型可选。",
+    "detail": "docs/DETAIL.md"
+  }
+}

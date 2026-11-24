@@ -1,0 +1,46 @@
+# Quip footer（俏皮话）
+
+每轮回复完成后，用一次独立的已注册模型小调用生成一句拟人语气自评，作为小字渲染在该轮回复末尾，并以 plugin record 写入会话日志。
+
+> 0.3.0 在真实 DSH 桌面版验证了生成、渲染与会话日志写入；0.4.0 把 plugin record 升到 v2（`after` 锚点、兜底句不再冒充模型生成、`plugin.outcome`）并去掉了请求层的 maxTokens 硬上限；0.5.0 升 v3：`step` 取本轮最后一步 + 1，不再与同轮的 `assistant/message` 同槽；0.5.1 升 v4：删掉 `attempt`。设置卡与生成记录面板只过了 jsdom 测试，未在真实界面确认。
+
+## 它做什么
+
+- 监听会话事件流，在每轮回复完成（`turn/end`）后，把「用户这轮的发言摘要 + 助手实际做了什么（输出摘要、工具使用、耗时）」交给一个独立的小模型调用，生成一句话，渲染在那轮回复的末尾。
+- 这句话不出现在主模型的上下文里。
+- 写入会话日志（plugin record，`ignorable` 标记，带 token usage）：重启后恢复，随 fork / 导出携带。record 的 data 与原生 `assistant/message` 同构，并用 `after` 钉回它所评论的那条回复（最后一条 `assistant/message` 的 `seq`/`message.id` 与 `turn/end` 的 `seq`）。
+- 兜底句与模型生成的句子在 record 里可区分：前者的 `message.source.kind` 是插件自有 producer kind `dsh-quip`（不挂模型），后者是 `model` 并带 provider/model；`plugin.outcome` 另记模型调用的结局。
+
+## 目前不能做什么
+
+- **不进入 DSH 官方的 token 统计**。官方面板只统计主对话的模型调用；usage 在会话日志里，但官方面板不读它。
+
+## 风格
+
+| 风格 | 感觉 |
+|------|------|
+| playful 俏皮（默认） | 像干完活歪头邀功：「（叉腰）这波我自己都觉得很可以」 |
+| hype 夸夸 | 热情吹捧本轮战绩 |
+| roast 毒舌自嘲 | 温和地损自己，火力对准自己 |
+| calm 冷静自评 | 工程师收工日志：「本轮定位到根因并修复，回归通过」 |
+| custom 自定义 | 由你提供提示词，描述人设与语气 |
+
+## 模型与降级
+
+- 生成走 DSH 已注册的模型，设置卡下拉可选。
+- 调用超时 30 秒（`QUIP_TIMEOUT_MS` 可覆盖）；超时、失败时落到该风格的内置兜底池（可关）；模型判定素材不足时跳过。
+- 每次生成的「结局」（ok / empty / timeout / aborted / error / skip / no-provider）和「来源」（model / fallback）分别记录，超时后兜底不会把超时原因盖掉。
+- 请求层不设 maxTokens：长度只靠系统提示里的「不超过 N 字」约束。带思考的模型会把思考算进输出配额，硬上限会在正文出来前把生成截断。
+- 素材进模型前脱敏：密钥与 token 模式替换为 `[redacted]`，工具结果不进提示词。
+
+## 生成记录
+
+设置卡下方的「查看生成记录」可展开最近生成的素材（已脱敏）、系统提示词、模型原始输出、token 计量、耗时、结局与错误。同时落盘到 `$DSH_HOME/quip/generations.jsonl`（滚动 500 条）。
+
+## 配置入口
+
+设置页的「俏皮话」卡片（含模型下拉）。修改后点保存即时生效。
+
+## 诊断
+
+`GET /api/quip/v1/health` 匿名可读，`persistence` 字段给出写入器来源（`host-probed` 为正常）、宿主与写入器 URL 的比对（`match`）、成功/失败计数与最近错误。写入失败时先看这里。

@@ -1,0 +1,82 @@
+{
+  "name": "@yulaiz/dsh-quip",
+  "version": "0.5.1",
+  "description": "Quip footer for DeepSeek Harness: after each completed reply, an independent registered-model call writes one line of self-review shown at the turn tail; persisted into the session log as a plugin record. / DeepSeek Harness 俏皮话插件：每轮回复完成后，用独立已注册模型生成一句拟人自评小字，渲染在该轮末尾；以 plugin record 写入会话日志持久化。",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "quip",
+    "turn-tail",
+    "persona"
+  ],
+  "license": "MIT",
+  "author": "YuLaiZ (https://github.com/YuLaiZ)",
+  "homepage": "https://github.com/YuLaiZ/dsh-quip#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YuLaiZ/dsh-quip.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YuLaiZ/dsh-quip/issues"
+  },
+  "type": "module",
+  "main": "src/index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": {
+      "default": "./src/index.js"
+    },
+    "./styles": {
+      "default": "./src/styles.js"
+    },
+    "./quip-lib": {
+      "default": "./src/quip-lib.js"
+    },
+    "./client": {
+      "default": "./src/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "locale/*.json",
+    "cordis.patch.yml",
+    "icon.svg",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc.1"
+  },
+  "scripts": {
+    "check": "node --check src/index.js && node --check src/styles.js && node --check src/quip-lib.js && node --check src/client.js",
+    "test": "rm -rf /tmp/dsh-quip-test && QUIP_DATA_DIR=/tmp/dsh-quip-test node tests/host-smoke.mjs && node tests/client-render.mjs 2>/dev/null"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2 || >=3.18.6-alpha.2 <4.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

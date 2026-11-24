@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Quip footer",
+    "description": "After each completed reply, an independent registered-model call writes a one-line self-review shown at the end of that turn; persisted into the session log as a plugin record so it survives restarts and travels with forks/exports. Styles: playful, hyping, self-roasting, calm, or custom; model selectable.",
+    "detail": "docs/DETAIL.md"
+  }
+}

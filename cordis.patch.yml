@@ -1,0 +1,6 @@
+# Bundle patch：在 profile 上插入一行。
+# 行名从 profile 自己的 node_modules 解析（「添加插件」或 install_bundle 安装本包）。
+# Host 半边负责事件折叠、独立模型调用与 HTTP 端点；Client 半边负责渲染与设置卡。
+- insert:
+    - id: quip
+      name: '@yulaiz/dsh-quip'
