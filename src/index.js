@@ -60,7 +60,8 @@ const RECORD_TYPE = 'plugin:dsh-quip/quip'
 /**
  * plugin record 的 `data` 格式版本。当前为 1。
  *
- * 0.6.0 是一次清零：此前的记录格式与全部历史数据一并作废、从会话日志清除，版本号从 1 重新计起。
+ * v1 是一次清零：此前的记录格式与全部历史数据一并作废、从会话日志清除，格式版本从 1 重新计起
+ * （插件的包版本与此无关：未发布不改版本号，一直是 0.1.0）。
  * 冷读只认 `v === 1` 且结构完整的记录；清除历史时写入的 {@link PURGED_RECORD_TYPE} 占位行 type 不同，自然落选。
  *
  * 结构（与 DSH 原生 `assistant/message.data` 同构）：
@@ -124,7 +125,7 @@ const LEGACY_GEN_FILE = join(DATA_DIR, 'generations.jsonl')
 const GEN_FILE_PREFIX = 'generations-'
 const GEN_FILE_RE = /^generations-(\d{8}-\d{6})(?:-\d+)?\.jsonl$/
 /** 本包版本（health 端点与日志用；与 package.json 同步）。 */
-const VERSION = '0.6.0'
+const VERSION = '0.1.0'
 
 // ---- 生成过程记录文件（纯函数，不依赖 ctx） ----
 

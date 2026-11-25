@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 清除 dsh-quip 的全部历史俏皮话记录（一次性迁移工具，0.6.0 清零时用过）。
+ * 清除 dsh-quip 的全部历史俏皮话记录（一次性迁移工具，record 格式重置为 v1 时用过）。
  *
  * 做两件事：
  *  1. 会话日志里不是当前格式的 `plugin:dsh-quip/quip` record → 原地替换为 `plugin:dsh-quip/purged`

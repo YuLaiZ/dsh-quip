@@ -81,7 +81,7 @@ Web 版与桌面版各自独立安装，profile 互不相通。本插件目前�
 - **事件驱动**：host 侧订阅 `session/event`，在 `turn/end`（`reason.kind === 'completed'`）后发起一次 `llm.stream` 调用（`purpose: 'dsh-quip/generate'`，30 秒超时）；client 渲染在 `conversation.chat.turnTail`，用 SSE 接收增量，断开时降级为 8 秒轮询。
 - **文本不做二次加工**：模型输出只去首尾空白，不剥包裹引号、不截首行——回复末尾看到的就是模型真实输出的那句；模型失败时的兜底句来自内置兜底池。两者在记录与 record 里用 `source` 区分（`model` / `fallback`）。
 - **长度只靠系统提示约束**：请求层不设 maxTokens。带思考的模型会把思考算进输出配额，硬上限曾在正文出来前把生成截断；系统提示写死「不超过 N 字、思考过程不进正文」。
-- **写入会话日志**：`appendPluginRecord(session, 'plugin:dsh-quip/quip', data)`。data 顶层为 `{v, turn, step, message, usage, request, after, plugin}`：`turn` / `step` / `message` / `usage` / `request` 与原生 `assistant/message.data` 同构，`step` 取本轮最后一步 + 1（占一个主对话永远不会走到的虚拟步，不与同轮回复同槽）；`after` 记录本轮最后一条 `assistant/message` 的日志 `seq` 与 `message.id`；`plugin` 是插件元数据（风格、文本来源 `source`、调用结局 `outcome`、路由来源、耗时）。格式版本 `v` 为 1（0.6.0 重置）；读回时 `v`、`message.content`、`after` 三者齐备才认，其余一律跳过。
+- **写入会话日志**：`appendPluginRecord(session, 'plugin:dsh-quip/quip', data)`。data 顶层为 `{v, turn, step, message, usage, request, after, plugin}`：`turn` / `step` / `message` / `usage` / `request` 与原生 `assistant/message.data` 同构，`step` 取本轮最后一步 + 1（占一个主对话永远不会走到的虚拟步，不与同轮回复同槽）；`after` 记录本轮最后一条 `assistant/message` 的日志 `seq` 与 `message.id`；`plugin` 是插件元数据（风格、文本来源 `source`、调用结局 `outcome`、路由来源、耗时）。格式版本 `v` 为 1；读回时 `v`、`message.content`、`after` 三者齐备才认，其余一律跳过。
 - **写入器怎么拿到**：DSH 的 `appendPluginRecord` 经 Session 的私有方法写入，V8 对私有方法的品牌检查绑定在类定义上——必须拿到宿主进程加载的那个 `dsh-session` 模块实例，npm 副本或另一 URL 的副本都会抛 `Receiver must be an instance of class Session`。插件对宿主 Session 实例调 `session.append(null)`，让它在内部抛出一个不改变日志的 TypeError，用 `Error.prepareStackTrace` 读出该方法的源文件 URL，再 `import()` 同一 URL 命中模块缓存。
 
 ## 兼容性
@@ -112,17 +112,17 @@ Web 版与桌面版各自独立安装，profile 互不相通。本插件目前�
 
 ## 当前状态
 
-0.6.0。生成、渲染、会话日志写入三项已在真实 DSH 桌面版验证通过。**0.6.0 是破坏性更新**：plugin record 格式版本重置为 v1，之前的全部俏皮话记录已从会话日志清除，升级后不再显示；新记录带会话日志坐标，生成记录面板可定位到会话文件里的那一行。设置卡与生成记录面板只过了 jsdom 测试，**未在真实界面逐项验收**。
+生成、渲染、会话日志写入三项已在真实 DSH 桌面版验证通过；设置卡、生成记录面板与回复末尾的小字在 dsh web 真实渲染验证并按截图迭代过。新记录带会话日志坐标，生成记录面板可定位到会话文件里的那一行；生成记录按 500 条一个文件永久保留，可在设置卡打开目录自行管理。插件尚未发布到 npm，版本号保持 0.1.0。
 
 ## 开发
 
 ```
 src/index.js     Host：事件折叠、llm.stream 调用、会话日志写入器探测、冷读恢复、SSE/HTTP 端点、生成记录、configEditor 写回
 src/styles.js    风格预设（系统提示词 + 兜底池）
-src/quip-lib.js  素材折叠、脱敏、输出清洗
+src/quip-lib.js  素材折叠、脱敏
 src/client.js    Client：turnTail 渲染、SSE 订阅、设置卡 + 生成记录面板（含定位命令）
 tests/           host 集成测试（真实走一遍写入器解析）、client jsdom 渲染测试
-scripts/         purge-legacy-records.mjs：清除 0.6.0 之前历史记录的一次性迁移工具（写回时保持多帧结构）
+scripts/         purge-legacy-records.mjs：清除历史俏皮话记录的一次性迁移工具（写回时保持多帧结构）
                  repair-zstd-frames.mjs：修复被压成单帧的会话日志，恢复 DSH 可读的帧结构
                  restore-workspace-membership.mjs：把掉出工作区账本的会话挂回列表
 ```
