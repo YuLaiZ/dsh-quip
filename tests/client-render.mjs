@@ -42,6 +42,8 @@ globalThis.fetch = dom.window.fetch = async (url) => {
           ] },
         ],
         styles: ['playful', 'hype', 'roast', 'calm', 'custom'],
+        // 记录目录的真实路径：面板「打开记录文件夹」把它交给宿主
+        dataDir: '/tmp/dsh-quip-test/generations',
       }),
     }
   }
@@ -54,8 +56,9 @@ globalThis.fetch = dom.window.fetch = async (url) => {
           // 会话日志定位坐标（host 在 record 落盘后回填）
           step: 8, messageId: 'quip-s1-1-8-abc', recordSeq: 105, afterSeq: 102, turnEndSeq: 104,
           provider: 'zai-coding-cn', model: 'glm-5.3-flash',
-          material: '素材正文', systemPrompt: '系统提示词', raw: '原始输出',
-          cleaned: '（叉腰）稳了', source: 'model',
+           material: '素材正文', systemPrompt: '系统提示词',
+          // 一个 text 字段 = 用户最终看到的那句（模型原文或兜底句），来源看 source；file = 所属记录文件
+          text: '（叉腰）稳了', file: 'generations-20261124-172100.jsonl', source: 'model',
           usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
           durationMs: 800, error: null,
         }],
@@ -114,8 +117,16 @@ const moduleExports = loaded.factory(require)
 const injected = new Map()
 const registered = new Map()
 let currentSlotName = ''
+// 会话 Remote mock：记录面板「打开记录文件夹」经它在系统文件管理器里打开目录
+const openedPaths = []
 const mockCtx = {
   effect(setup) { const dispose = setup?.(); return () => dispose?.() },
+  remote: {
+    session: {
+      canOpenWorkspacePath: async () => ({ ok: true, value: true }),
+      openWorkspacePath: async (request) => { openedPaths.push(request); return { ok: true, value: { opened: true } } },
+    },
+  },
   slots: {
     inject(name, callback) { injected.set(name, callback) },
     register(options, component) { registered.set(`${currentSlotName}:${options.id}`, { options, component }) },
@@ -145,6 +156,8 @@ assert.notEqual(tailEntry.options.id, settingsEntry.options.id, 'tail and settin
   assert.ok(container.textContent.includes('（叉腰）稳了'), `tail shows quip: ${container.textContent.slice(0, 160)}`)
   assert.ok(html.includes('data-quip-turn="1"'), 'tail carries turn marker')
   assert.ok(!html.includes('qp-wait'), 'no waiting placeholder once the quip arrived')
+  // 旁白风格：不再有气泡图标（竖线由 CSS ::before 画）
+  assert.ok(!html.includes('qp-tail-mark'), 'tail has no icon mark')
   root.unmount()
 }
 
@@ -285,14 +298,19 @@ assert.notEqual(tailEntry.options.id, settingsEntry.options.id, 'tail and settin
   })
   await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
 
-  // 展开生成记录面板（第二个 qp-card 的 qp-gen-head 按钮）
-  const toggle = container.querySelector('.qp-gen-head .qp-btn')
-  assert.ok(toggle !== null, 'generation toggle button exists')
+  // 展开生成记录面板：标题行整体是 toggle（jsdom 里没有宿主 primitives，走自绘的 role=button 标题行）
+  const toggle = container.querySelector('.qp-gen-head[role="button"]')
+  assert.ok(toggle !== null, 'generation toggle row exists')
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false', 'toggle row starts collapsed')
   await actFn(async () => { toggle.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
   await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
   await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
   const afterOpen = container.innerHTML
   assert.ok(afterOpen.includes('qp-gen-list'), 'generation list rendered after toggle')
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true', 'toggle row reports expanded')
+  assert.ok(afterOpen.includes('qp-gen-chevron'), 'self-drawn chevron rendered without host primitives')
+  // 刷新模型列表是带文字的按钮，不再是字符图标
+  assert.ok([...container.querySelectorAll('button')].some((b) => /刷新|Refresh/.test(b.textContent)), 'refresh is a labelled button')
   assert.ok(afterOpen.includes('（叉腰）稳了'), 'generation record text visible')
 
   // 点开一条记录详情（素材 / 原始输出）
@@ -300,7 +318,7 @@ assert.notEqual(tailEntry.options.id, settingsEntry.options.id, 'tail and settin
   assert.ok(row !== null, 'generation row exists')
   await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
   const detail = container.innerHTML
-  assert.ok(detail.includes('素材正文') || detail.includes('原始输出'), 'record detail expanded')
+  assert.ok(detail.includes('素材正文'), 'record detail expanded')
 
   // 会话日志定位：详情列出 turn / seq / step / message.id / after 锚点，并给出可复制的定位命令
   const locate = container.querySelector('.qp-gen-locate')
@@ -316,6 +334,26 @@ assert.notEqual(tailEntry.options.id, settingsEntry.options.id, 'tail and settin
   for (const expected of ['1', '105', '8', 'quip-s1-1-8-abc', '102']) {
     assert.ok(detailText.includes(expected), 'detail shows locate coordinate ' + expected)
   }
+  // 合并后的文本字段：详情只有「文本」一项，不再有「结果 / 模型原始输出」两份
+  assert.ok(detailText.includes('文本'), 'detail shows the merged text field')
+  assert.ok(!detailText.includes('模型原始输出'), 'raw output row is gone')
+  assert.ok(!detailText.includes('结果'), 'result row is gone')
+  assert.ok(detailText.includes('（叉腰）稳了'), 'detail text is the shown line')
+  // 每条记录显示所属文件：行内一处、详情里带完整路径一处
+  assert.equal(container.querySelectorAll('.qp-gen-file').length, 1, 'row shows the record file name')
+  // 行内只显示时间戳部分（窄面板下省宽度），完整文件名在 hover title 里
+  assert.equal(container.querySelector('.qp-gen-file').textContent, '20261124-172100')
+  assert.equal(container.querySelector('.qp-gen-file').getAttribute('title'), '/tmp/dsh-quip-test/generations/generations-20261124-172100.jsonl')
+  assert.ok(detailText.includes('/tmp/dsh-quip-test/generations/generations-20261124-172100.jsonl'), 'detail shows the full record path')
+  // 「打开记录文件夹」：宿主能打开 → 按钮可用；点击把目录路径交给 session Remote（不带 action = 直接进入目录）
+  const openBtn = [...container.querySelectorAll('.qp-gen-head-actions .qp-btn')].find((b) => /打开记录文件夹/.test(b.textContent))
+  assert.ok(openBtn !== null, 'open-folder button rendered when the panel is open')
+  assert.equal(openBtn.disabled, false, 'open-folder button is enabled when the host can open paths')
+  await actFn(async () => { openBtn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.deepEqual(openedPaths, [{ path: '/tmp/dsh-quip-test/generations' }], 'open-folder hands the records dir to session.openWorkspacePath without an action')
+  // 保留策略提示：告诉用户不会自动清理、想删就删文件
+  assert.ok(/永久保存/.test(container.querySelector('.qp-gen-hint:last-of-type')?.textContent ?? ''), 'retention hint is shown')
   // jsdom 没有 clipboard：点复制应落到「复制失败，请手动选中复制」而不是抛错
   await actFn(async () => { copyBtn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
   assert.ok(/复制失败|Copy failed/.test(container.querySelector('.qp-gen-locate button').textContent), 'missing clipboard degrades to a hint')

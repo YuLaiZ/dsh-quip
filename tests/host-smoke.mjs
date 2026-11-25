@@ -8,7 +8,7 @@
  * 三次失败的原因。
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -94,6 +94,7 @@ const ctx = {
           yield { type: 'finish', reason: 'error', error: new Error('insufficient quota') }
         })()
       }
+      if (streamMode === 'quoted') return okStream('"把引号也当成我的一部分"')
       return okStream('（叉腰）这波我自己都觉得很可以')
     },
   },
@@ -116,7 +117,8 @@ const ctx = {
       }
     }
     if (name === 'sessionQuery') {
-      return { readSession: async () => ({ events: coldLogEvents }) }
+      // 冷读与「轮次中途重载后的素材补折」共用：按会话 id 给不同夹具
+      return { readSession: async (id) => ({ events: id === 'session-rebuild' ? rebuildEvents : coldLogEvents }) }
     }
     return undefined
   },
@@ -148,6 +150,14 @@ const coldLogEvents = [
   // 当前格式 ×2：模型句 + 兜底句
   { type: 'plugin:dsh-quip/quip', seq: 7, time: 7000, ignorable: true, data: currentRecord(5, 6, 'model', '当前格式的模型句') },
   { type: 'plugin:dsh-quip/quip', seq: 8, time: 8000, ignorable: true, data: currentRecord(7, 1, 'dsh-quip', '当前格式的兜底句', { outcome: 'timeout' }) },
+]
+
+// 流程 9 的夹具：补折用的一轮日志，故意不含 turn/end（模拟尚未持久化）
+const rebuildEvents = [
+  { type: 'turn/start', seq: 20, time: Date.now() - 3000, data: { turn: 5 } },
+  { type: 'user/message', seq: 21, time: Date.now() - 3000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '补折轮次的用户发言' }] } },
+  { type: 'assistant/message', seq: 28, time: Date.now() - 1000, data: { turn: 5, step: 1, message: { id: 'asst-rebuild', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [{ type: 'text', text: '补折轮次的回复' }] } } },
+  { type: 'step/end', seq: 28.5, time: Date.now() - 900, data: { turn: 5, step: 3 } },
 ]
 
 const config = {
@@ -187,6 +197,19 @@ const config = {
   assert.equal(probeHostSessionUrl(null), null)
 }
 
+// ---- 记录目录预置：旧版单文件 + 一个已满 500 条的文件 ----
+// 旧版单文件：首条 ts 取 2024-06-01 12:00:00 本地时间，迁移后应命名为 generations-20240601-120000.jsonl；
+// 用旧字段 cleaned（最终文本）验证加载时的字段归一化。
+const LEGACY_TS = new Date(2024, 5, 1, 12, 0, 0).getTime()
+mkdirSync(process.env.QUIP_DATA_DIR, { recursive: true })
+writeFileSync(join(process.env.QUIP_DATA_DIR, 'generations.jsonl'),
+  JSON.stringify({ ts: LEGACY_TS, session: 'session-legacy', turn: 90001, raw: 'ignored', cleaned: '旧格式的最终文本', source: 'model' }) + '\n')
+// 已满的文件：名字要排在迁移文件之后（= 目录里最新），这样下一条记录才会另起新文件
+const PREFILL_NAME = 'generations-20250101-000000.jsonl'
+mkdirSync(join(process.env.QUIP_DATA_DIR, 'generations'), { recursive: true })
+writeFileSync(join(process.env.QUIP_DATA_DIR, 'generations', PREFILL_NAME),
+  Array.from({ length: 500 }, (_, i) => JSON.stringify({ ts: LEGACY_TS + 100000 + i, session: 'session-prefill', turn: 10000 + i, text: 'prefill ' + i, file: PREFILL_NAME })).join('\n') + '\n')
+
 apply(ctx, config)
 
 // ---- helpers ----
@@ -200,9 +223,9 @@ function makeRes() {
   return res
 }
 const session = { id: 'session-test-1', header: { origin: null, delegationDepth: 0 } }
-const emit = (event) => {
+const emit = (event, sess = session) => {
   for (const { name, listener } of listeners) {
-    if (name === 'session/event') listener(session, event)
+    if (name === 'session/event') listener(sess, event)
   }
 }
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -327,7 +350,8 @@ assert.deepEqual(fakeSession.calls[0].data.usage, { inputTokens: 321, outputToke
   const body = JSON.parse(res.body)
   const record = body.generations[0]
   assert.equal(record.source, 'model')
-  assert.equal(record.raw, '（叉腰）这波我自己都觉得很可以')
+  assert.equal(record.text, '（叉腰）这波我自己都觉得很可以')
+  assert.equal('raw' in record, false, 'one text field only')
   assert.ok(record.material.includes('帮我修一下登录页'))
   assert.ok(record.systemPrompt.includes('俏皮'))
 }
@@ -467,7 +491,9 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
   assert.equal(t7.outcome, 'timeout', 'model-call outcome records the timeout')
   assert.equal(t7.source, 'fallback', 'fallback still supplies a line after timeout')
   assert.match(t7.error, /exceeded 150 ms/)
-  assert.equal(t7.raw, '半句', 'partial output captured before abort')
+  // 中途被中止的部分输出不再单独保留：text 就是用户最终看到的那句（兜底句），原因看 error
+  assert.notEqual(t7.text, '半句', 'partial output is not what the user saw')
+  assert.ok(t7.text !== '', 'fallback text is the final text')
 }
 // 超时后仍按 fallback 配置给出一句，不丢轮
 {
@@ -493,7 +519,7 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
     assert.match(t11.error, /returned no text/)
     // 兜底仍然给出一句，用户不至于什么都没有
     assert.equal(t11.source, 'fallback')
-    assert.ok(t11.cleaned !== '', 'fallback still supplies a line')
+    assert.ok(t11.text !== '', 'fallback still supplies a line')
   }
   {
     // 「调用了模型但零输出 → 兜底」与「没调模型 → 兜底」在 record 里靠 outcome 区分；
@@ -626,13 +652,64 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
   config.model = 'auto'
 }
 
-// ---- 生成记录落盘 ----
+
+// ---- 流程 8d：模型原文不再加工——带包裹引号的输出原样成为最终文本 ----
 {
-  const file = readFileSync(join(process.env.QUIP_DATA_DIR, 'generations.jsonl'), 'utf8')
-  const lines = file.split('\n').filter(Boolean)
+  streamMode = 'quoted'
+  emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn: 21 }, seq: 61 })
+  emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第二十一轮' }] }, seq: 62 })
+  emit({ type: 'turn/end', time: Date.now(), data: { turn: 21, reason: { kind: 'completed' } }, seq: 63 })
+  await wait(120)
+  const res = makeRes()
+  await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=5' }, res)
+  const t21 = JSON.parse(res.body).generations.find((entry) => entry.turn === 21)
+  assert.equal(t21.source, 'model')
+  // 只去首尾空白：包裹整句的一对引号保留，不再剥掉；写进会话日志的也是同一句
+  assert.equal(t21.text, '"把引号也当成我的一部分"', 'quoted model output is shown verbatim')
+  assert.equal(fakeSession.calls.at(-1).data.message.content[0].text, '"把引号也当成我的一部分"', 'record text equals the shown text')
+  streamMode = 'ok'
+}
+
+
+// ---- 流程 9：轮次中途插件重载（内存素材丢失）→ turn/end 时从会话日志补折，这轮不丢 ----
+{
+  // 模拟重载后的 ctx：turn/start 与中间事件都没被看到，只收到 turn/end；
+  // readSession 返回的日志里本轮 turn/end 尚未持久化（批处理窗口内）——after.seq 来自日志、after.turnEndSeq 来自实时事件
+  const sess = { id: 'session-rebuild', header: { origin: null, delegationDepth: 0 } }
+  const before = generatedCalls.length
+  emit({ type: 'turn/end', time: Date.now(), data: { turn: 5, reason: { kind: 'completed' } }, seq: 30 }, sess)
+  await wait(150)
+  assert.equal(generatedCalls.length, before + 1, 'turn/end without in-memory material rebuilds it from the session log and still generates')
+  const call = generatedCalls[before]
+  assert.ok(call.messages[0].content[0].text.includes('补折轮次的用户发言'), 'rebuilt material carries the user text from the log')
+  assert.ok(call.messages[0].content[0].text.includes('补折轮次的回复'), 'rebuilt material carries the assistant text from the log')
+  const rec = fakeSession.calls.at(-1).data
+  assert.equal(rec.turn, 5)
+  assert.equal(rec.step, 4, 'virtual step = last step/end in the log + 1')
+  assert.equal(rec.after.seq, 28, 'after.seq is the last assistant/message read from the log')
+  assert.equal(rec.after.messageId, 'asst-rebuild')
+  assert.equal(rec.after.turnEndSeq, 30, 'turnEndSeq comes from the live turn/end event')
+  // 找不到本轮 turn/start（日志里没有这一轮）→ 安静放弃，不抛错、不生成
+  const before2 = generatedCalls.length
+  emit({ type: 'turn/end', time: Date.now(), data: { turn: 77, reason: { kind: 'completed' } }, seq: 40 }, sess)
+  await wait(80)
+  assert.equal(generatedCalls.length, before2, 'a turn/end whose turn is absent from the log is dropped quietly')
+}
+
+// ---- 生成记录落盘：按 500 条分文件、只追加不重写、永久保留 ----
+{
+  const dir = join(process.env.QUIP_DATA_DIR, 'generations')
+  const names = readdirSync(dir).sort()
+  // 预置的满文件 + 迁移进来的旧文件 + 本次运行新建的文件；旧版单文件已不在数据目录根下
+  assert.deepEqual(names.slice(0, 2), ['generations-20240601-120000.jsonl', PREFILL_NAME], 'legacy file migrated with its first-record stamp; prefill kept')
+  assert.equal(names.length, 3, 'a full file makes the next record start a new file')
+  assert.equal(existsSync(join(process.env.QUIP_DATA_DIR, 'generations.jsonl')), false, 'legacy single file was moved, not copied')
+  const freshName = names[2]
+  assert.match(freshName, /^generations-\d{8}-\d{6}\.jsonl$/, 'file name is the first record\'s local time')
+  const lines = readFileSync(join(dir, freshName), 'utf8').split('\n').filter(Boolean)
   // 触发生成的轮次：1 2(brand-fail) 3(sse) 6(llm-fail) 7(timeout) 8 9 10 11(empty) 12(finish-error)
-  // 13 14 15(跟随/固定路由) 20(step+1) = 14 条
-  assert.equal(lines.length, 14, 'one generation record per attempted turn')
+  // 13 14 15(跟随/固定路由) 20(step+1) 21(quoted) 5(rebuild) = 16 条
+  assert.equal(lines.length, 16, 'one generation record per attempted turn, all in the fresh file')
   const traces = lines.map((line) => JSON.parse(line))
   // 文件按追加顺序，第一条是 turn 1
   const first = traces[0]
@@ -646,15 +723,55 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
   assert.equal(first.afterSeq, rec1.after.seq)
   assert.equal(first.turnEndSeq, rec1.after.turnEndSeq)
   for (const trace of traces) {
+    assert.equal(trace.file, freshName, 'every record names the file it lives in')
+    assert.equal('raw' in trace, false, 'raw is gone: one text field only')
+    assert.equal('cleaned' in trace, false, 'cleaned is gone: one text field only')
     assert.deepEqual(
-      ['afterSeq', 'messageId', 'recordSeq', 'step', 'turnEndSeq'].filter((key) => !(key in trace)),
+      ['afterSeq', 'file', 'messageId', 'recordSeq', 'step', 'text', 'turnEndSeq'].filter((key) => !(key in trace)),
       [], `every trace carries the locate coordinates: ${JSON.stringify(Object.keys(trace))}`)
   }
   // 写入失败（turn 2 品牌检查失败）的记录：recordSeq 为 null，但 step / messageId 仍在
   const brandFail = traces.find((trace) => trace.turn === 2)
   assert.equal(brandFail.recordSeq, null, 'failed persist leaves recordSeq null')
   assert.equal(typeof brandFail.messageId, 'string', 'messageId is still recorded when persist fails')
+  // 预置文件未被改动：永久保留、不重写
+  const prefillLines = readFileSync(join(dir, PREFILL_NAME), 'utf8').split('\n').filter(Boolean)
+  assert.equal(prefillLines.length, 500, 'the full pre-existing file is untouched')
+  // 迁移文件内容与原旧文件一致（只 rename）
+  const migrated = JSON.parse(readFileSync(join(dir, names[0]), 'utf8').trim())
+  assert.equal(migrated.cleaned, '旧格式的最终文本', 'migration only renames; content untouched')
 }
+
+// ---- 删文件后重载：用户在文件管理器里删掉记录文件，面板查询立即反映 ----
+{
+  const before = makeRes()
+  await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=500' }, before)
+  const beforeList = JSON.parse(before.body).generations
+  assert.equal(beforeList.length, 500, 'memory cap: at most GEN_MEMORY_LIMIT records')
+  assert.ok(beforeList.some((entry) => entry.session === 'session-prefill'), 'pre-existing file is loaded into memory')
+  rmSync(join(process.env.QUIP_DATA_DIR, 'generations', PREFILL_NAME))
+  const after = makeRes()
+  await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=500' }, after)
+  const afterList = JSON.parse(after.body).generations
+  assert.equal(afterList.some((entry) => entry.session === 'session-prefill'), false, 'deleted file drops out without a restart')
+  assert.equal(afterList.length, 17, '16 fresh + 1 migrated legacy record')
+  const legacy = afterList.find((entry) => entry.session === 'session-legacy')
+  assert.equal(legacy.text, '旧格式的最终文本', 'legacy cleaned field is normalised into text on load')
+  assert.equal('raw' in legacy, false, 'legacy raw is dropped on load')
+  assert.equal(legacy.file, 'generations-20240601-120000.jsonl', 'legacy record names the migrated file')
+  // limit 上限 500：请求 1000 也只给 500
+  const capped = makeRes()
+  await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=1000' }, capped)
+  assert.equal(JSON.parse(capped.body).generations.length, 17)
+}
+
+// ---- status：暴露记录目录的真实路径（面板「打开记录文件夹」用） ----
+{
+  const res = makeRes()
+  await routes.get('/api/quip/v1/status').handler({ url: '/api/quip/v1/status' }, res)
+  assert.equal(JSON.parse(res.body).dataDir, realpathSync(join(process.env.QUIP_DATA_DIR, 'generations')), 'dataDir is the real path of the records dir')
+}
+
 
 console.log('host mock integration smoke: ALL OK')
 process.exit(0)

@@ -6,7 +6,7 @@
  *  1. 会话日志里不是当前格式的 `plugin:dsh-quip/quip` record → 原地替换为 `plugin:dsh-quip/purged`
  *     空记录，外层 seq / time 保留。DSH 读回要求每个事件的 seq 严格等于行号，直接删行会让会话
  *     打不开，所以只能原位清空内容。当前格式（`data.v === 1` 且 `message.content` 是数组）保留。
- *  2. 插件自有的 `generations.jsonl`（生成过程记录）→ 删除。
+ *  2. 插件自有的生成过程记录（旧版单文件 `generations.jsonl`、新版目录 `generations/`）→ 整体移入备份。
  *
  * 先备份原文件；重写后再解压读一遍，核对行数与 seq 连续性。
  *
@@ -164,17 +164,17 @@ for (const file of existsSync(SESSIONS_ROOT) ? collectLogs(SESSIONS_ROOT, []) : 
   if (result.purged > 0) console.log(`${DRY_RUN ? '[dry-run] ' : ''}${relative(SESSIONS_ROOT, file)}: purged ${result.purged}, kept ${result.kept}`)
 }
 
-const genFile = join(DATA_DIR, 'generations.jsonl')
-if (existsSync(genFile)) {
-  if (DRY_RUN) console.log(`[dry-run] would remove ${genFile}`)
+// 旧版是数据目录下的单文件，新版是其下的 generations/ 目录；两者都整体搬走，不逐行解析
+for (const name of ['generations.jsonl', 'generations']) {
+  const genPath = join(DATA_DIR, name)
+  if (!existsSync(genPath)) continue
+  if (DRY_RUN) { console.log(`[dry-run] would remove ${genPath}`); continue }
+  if (NO_BACKUP) renameSync(genPath, genPath + '.trash')
   else {
-    if (NO_BACKUP) renameSync(genFile, genFile + '.trash')
-    else {
-      mkdirSync(BACKUP_ROOT, { recursive: true })
-      renameSync(genFile, join(BACKUP_ROOT, 'generations.jsonl'))
-    }
-    console.log(`removed ${genFile}`)
+    mkdirSync(BACKUP_ROOT, { recursive: true })
+    renameSync(genPath, join(BACKUP_ROOT, name))
   }
+  console.log(`removed ${genPath}`)
 }
 
 console.log('')

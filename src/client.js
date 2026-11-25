@@ -7,7 +7,10 @@
  *    `sessionId` 与 owner props `{ turn, seq }`。
  * 2. `settings.section`（list 槽）：设置页「俏皮话」卡片——开关、风格、
  *    模型（下拉列出已注册 provider/model）与自定义提示词；经
- *    /api/quip/v1/status 读取、/api/quip/v1/config 写回。
+ *    /api/quip/v1/status 读取、/api/quip/v1/config 写回。卡片下方是生成记录
+ *    面板：紧凑列表（时间 / 所属文件 / 模型 / 来源 / 文本 / 用量），展开看
+ *    定位坐标与素材；「打开记录文件夹」经宿主的 session Remote 在系统文件
+ *    管理器里打开记录目录（省略 action = 直接进入目录，不是在父目录选中）。
  *
  * 数据层：每会话一份 store——首挂 fetch 全量，EventSource 订阅增量；
  * SSE 因认证或网络失败进入 CLOSED 时降级为 8s 轮询。连接与订阅随引用
@@ -19,6 +22,18 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const h = React.createElement
+    /**
+     * 宿主的 UI 原子组件（可选依赖）：能 require 到就用宿主同一套折叠行 / 按钮，风格与设置页其他卡片一致；
+     * require 不到（例如 jsdom 测试）退回本包自绘的等价结构。
+     */
+    let primitives = null
+    try { primitives = require('@deepseek-ai/dsh-client-ui-primitives') } catch { primitives = null }
+    const DisclosureRow = primitives?.DisclosureRow ?? null
+    const HostButton = primitives?.Button ?? null
+    /** 统一按钮工厂：优先宿主 Button，否则原生 button.qp-btn；调用方只关心 props 与文字。 */
+    const makeButton = (props, label) => (HostButton !== null
+      ? h(HostButton, { variant: 'outline', size: 'sm', ...props }, label)
+      : h('button', { type: 'button', className: 'qp-btn', ...props }, label))
 
     /** API 前缀（与 host 半边一致）。 */
     const API = '/api/quip/v1'
@@ -65,17 +80,26 @@ window.__ModuleLoader__.load({
         loadFailed: '读取失败，稍后重试',
         noProviders: '没有已注册的模型 provider',
         genToggle: '查看生成记录',
+        genFolderHint: '记录按 500 条一个文件永久保存在记录目录，不再自动清理；要删历史直接删文件。',
+        genOpenFolder: '打开记录文件夹',
+        genOpened: '已打开',
+        genRefresh: '刷新',
+        genOpenFailed: '无法打开文件夹',
         genEmpty: '还没有生成记录（每轮回复后出现）',
         genTurn: '第 {n} 轮',
         genSource: { model: '模型', fallback: '兜底池', skip: '素材不足跳过', error: '失败', empty: '模型无输出', timeout: '超时', aborted: '中止', 'no-provider': '无 provider' },
-        genTokens: '{in} 进 / {out} 出 token',
+        genTokens: '{in} 进 / {out} 出',
         genDuration: '{ms} 毫秒',
-        genResult: '结果',
-        genRaw: '模型原始输出',
+        genMetaTokens: '{in}/{out}',
+        genMetaDuration: '{s}s',
+        genDurationLabel: '耗时',
+        genText: '文本',
         genMaterial: '素材（已脱敏）',
         genPrompt: '系统提示词',
-        genUsage: 'token 计量',
+        genUsage: 'token 用量',
+        genUsageFull: '{in} 进 / {out} 出 / 共 {total}',
         genError: '错误',
+        genFile: '记录文件',
         genShowMore: '载入更多',
         genTurnLabel: '轮次',
         genSeq: '会话日志 seq',
@@ -114,17 +138,26 @@ window.__ModuleLoader__.load({
         loadFailed: 'Load failed; retrying later',
         noProviders: 'No registered model provider',
         genToggle: 'View generation log',
+        genFolderHint: 'Records are kept forever, 500 per file, in the records folder; nothing is pruned automatically—delete files to clear history.',
+        genOpenFolder: 'Open records folder',
+        genOpened: 'Opened',
+        genRefresh: 'Refresh',
+        genOpenFailed: 'Could not open the folder',
         genEmpty: 'No generations yet (they appear after each reply)',
         genTurn: 'Turn {n}',
         genSource: { model: 'model', fallback: 'fallback pool', skip: 'skipped (thin material)', error: 'failed', empty: 'model returned nothing', timeout: 'timed out', aborted: 'aborted', 'no-provider': 'no provider' },
-        genTokens: '{in} in / {out} out tokens',
+        genTokens: '{in} in / {out} out',
         genDuration: '{ms} ms',
-        genResult: 'Result',
-        genRaw: 'Raw model output',
+        genMetaTokens: '{in}/{out}',
+        genMetaDuration: '{s}s',
+        genDurationLabel: 'Duration',
+        genText: 'Text',
         genMaterial: 'Material (redacted)',
         genPrompt: 'System prompt',
         genUsage: 'Token usage',
+        genUsageFull: '{in} in / {out} out / {total} total',
         genError: 'Error',
+        genFile: 'Record file',
         genShowMore: 'Load more',
         genTurnLabel: 'Turn',
         genSeq: 'Session log seq',
@@ -161,18 +194,24 @@ window.__ModuleLoader__.load({
     const outcomeLabel = (outcome) => (tr('genSource')[outcome] ?? outcome ?? '')
 
     // ---- 样式（仅主题 token；类名前缀 qp-） ----
+    /**
+     * 回复末尾的俏皮话：按「旁白」处理——左侧一条品牌色细竖线 + 小一号的灰字，
+     * 不斜体（中文斜体是伪斜体，发歪）、不放图标（竖线本身就是标记）。
+     * 竖线颜色取主题 brand 色再降透明度，浅色 / 深色主题下都只做提示不抢正文。
+     */
     const TAIL_CSS = [
-      '.qp-tail{display:flex;align-items:baseline;gap:6px;max-width:100%;margin:2px 0 6px;',
-      'padding:0 2px;color:var(--dsw-alias-label-tertiary);',
+      '.qp-tail{position:relative;display:flex;align-items:baseline;gap:8px;max-width:100%;margin:4px 0 8px;',
+      'padding:1px 0 1px 10px;color:var(--dsw-alias-label-tertiary);',
       'font-size:calc(var(--dsh-content-font-size-secondary,13px) - 1px);',
       'line-height:calc(18px + var(--dsh-content-font-delta-secondary,0px));',
-      'font-style:italic;animation:qp-in .45s ease both}',
+      'animation:qp-in .45s ease both}',
+      '.qp-tail::before{content:"";position:absolute;left:0;top:4px;bottom:4px;width:2px;border-radius:1px;',
+      'background:var(--dsw-alias-brand-primary, var(--dsw-alias-label-tertiary));opacity:.38}',
       '@keyframes qp-in{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:none}}',
       '@media (prefers-reduced-motion: reduce){.qp-tail{animation:none}}',
-      '.qp-tail-mark{flex:none;align-self:center;width:12px;height:12px;color:var(--dsw-alias-label-quaternary, var(--dsw-alias-label-tertiary))}',
       '.qp-tail-text{min-width:0;overflow-wrap:anywhere}',
       // 等待态：轮次刚结束、俏皮话还在生成时的占位（三个跳动的点）
-      '.qp-wait{display:inline-flex;align-items:center;gap:3px;margin-left:6px;height:12px}',
+      '.qp-wait{display:inline-flex;align-items:center;gap:3px;height:12px}',
       '.qp-wait i{display:block;width:4px;height:4px;border-radius:50%;background:var(--dsw-alias-label-tertiary);',
       'animation:qp-wait-bounce 1.2s ease-in-out infinite}',
       '.qp-wait i:nth-child(2){animation-delay:.15s}',
@@ -181,75 +220,109 @@ window.__ModuleLoader__.load({
       '@media (prefers-reduced-motion: reduce){.qp-wait i{animation:none;opacity:.5}}',
     ].join('')
 
+    /** 「查看生成记录」标题行前的列表图标（宿主没有 DisclosureRow 时用）。 */
+    const GEN_LIST_ICON = h('svg', { viewBox: '0 0 16 16', width: 14, height: 14, 'aria-hidden': 'true', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round' },
+      h('path', { d: 'M5.5 4h8M5.5 8h8M5.5 12h8' }), h('circle', { cx: 2.8, cy: 4, r: 0.6, fill: 'currentColor', stroke: 'none' }), h('circle', { cx: 2.8, cy: 8, r: 0.6, fill: 'currentColor', stroke: 'none' }), h('circle', { cx: 2.8, cy: 12, r: 0.6, fill: 'currentColor', stroke: 'none' }))
+    /** 折叠行右侧的 chevron（展开时旋转 180°）。 */
+    const CHEVRON_ICON = h('svg', { viewBox: '0 0 12 12', width: 12, height: 12, fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round', strokeLinejoin: 'round' },
+      h('path', { d: 'M2.5 4.5 6 8l3.5-3.5' }))
+
     const SECTION_CSS = [
       '.qp-settings{display:flex;flex-direction:column;gap:16px;padding:8px 0;',
       'font-size:13px;line-height:22px;color:var(--dsw-alias-label-primary)}',
-      '.qp-card{display:flex;flex-direction:column;gap:4px;padding:12px 16px;',
+      // 面板自身做容器查询的锚：列表按面板宽度（不是视口）决定列的取舍
+      '.qp-card{container-type:inline-size;display:flex;flex-direction:column;gap:4px;padding:12px 16px;',
       'border:0.5px solid var(--dsw-alias-settings-card-stroke);border-radius:var(--dsw-radius-xl);',
       'background:var(--dsw-alias-settings-card-fill)}',
       '.qp-row{display:flex;align-items:center;justify-content:space-between;gap:16px;',
       'min-height:40px;padding:6px 0;box-sizing:border-box}',
-      '.qp-row-copy{display:flex;flex-direction:column;min-width:0}',
+      // 标签区弹性吸收宽度，控件区不收缩：否则控件区被挤到内部换行（刷新按钮掉到下一行）
+      '.qp-row-copy{display:flex;flex-direction:column;min-width:0;flex:1 1 auto}',
+      '.qp-row--top{align-items:flex-start}',
       '.qp-hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}',
       '.qp-divider{border-top:0.5px solid var(--dsw-alias-border-l2)}',
       '.qp-row input[type="checkbox"]{flex:0 0 auto;width:16px;height:16px;margin:0;',
       'accent-color:var(--dsw-alias-brand-primary);cursor:pointer}',
-      '.qp-select,.qp-text{box-sizing:border-box;width:220px;max-width:100%;height:28px;padding:0 8px;',
+      '.qp-select,.qp-text{box-sizing:border-box;width:200px;max-width:100%;height:28px;padding:0 8px;',
       'border:0.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);',
       'background:transparent;color:var(--dsw-alias-label-primary);font:inherit;}',
       '.qp-select:disabled,.qp-text:disabled{opacity:.55;cursor:default}',
       '.qp-select--narrow{width:130px}',
-      '.qp-actions{flex-wrap:wrap;row-gap:6px}',
       '.qp-area{box-sizing:border-box;width:100%;min-height:64px;padding:6px 8px;resize:vertical;',
       'border:0.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);',
       'background:transparent;color:var(--dsw-alias-label-primary);font:inherit}',
-      '.qp-actions{display:flex;justify-content:flex-end;align-items:center;gap:10px}',
+      '.qp-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px;flex:none;white-space:nowrap}',
       '.qp-btn{display:inline-flex;justify-content:center;align-items:center;box-sizing:border-box;',
       'height:28px;min-width:58px;padding:0 12px;border:0.5px solid var(--dsw-alias-border-l3);',
       'border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-primary);',
       'font-size:12px;line-height:20px;white-space:nowrap;cursor:pointer}',
       '.qp-btn[disabled]{opacity:.55;cursor:default}',
       '@media (hover: hover){.qp-btn:hover:not([disabled]){background:var(--dsw-alias-interactive-bg-hover)}}',
-      '.qp-select:focus-visible,.qp-text:focus-visible,.qp-area:focus-visible,.qp-btn:focus-visible{',
+      '.qp-select:focus-visible,.qp-text:focus-visible,.qp-area:focus-visible,.qp-btn:focus-visible,.qp-gen-head:focus-visible{',
       'outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));',
       'outline-offset:2px}',
       '.qp-status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}',
-      '.qp-gen-head{display:flex;justify-content:space-between;align-items:center;gap:16px;',
-      'min-height:40px;padding:6px 0}',
-      '.qp-gen-list{display:flex;flex-direction:column;gap:8px;',
-      'padding:2px 0}',
-      '.qp-gen-item{border:0.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);',
-      'overflow:hidden}',
-      '.qp-gen-row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;width:100%;padding:6px 10px;',
+      // 折叠标题行（宿主没有 DisclosureRow 时的自绘版）：整行可点，右侧按钮 + chevron
+      '.qp-gen-head{display:flex;justify-content:space-between;align-items:center;gap:12px;',
+      'min-height:36px;padding:4px 0;cursor:pointer;border-radius:var(--dsw-radius-sm)}',
+      '.qp-gen-head-title{display:flex;align-items:center;gap:8px;min-width:0;color:var(--dsw-alias-label-primary);',
+      'font-size:13px;line-height:22px}',
+      '.qp-gen-head-title svg{flex:none;color:var(--dsw-alias-label-tertiary)}',
+      '.qp-gen-head-actions{display:flex;align-items:center;gap:8px}',
+      '.qp-gen-chevron{display:inline-flex;color:var(--dsw-alias-label-tertiary);transition:transform .2s ease}',
+      '.qp-gen-chevron[data-open="true"]{transform:rotate(180deg)}',
+      '@media (prefers-reduced-motion: reduce){.qp-gen-chevron{transition:none}}',
+      '.qp-gen-hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);margin:0 0 8px}',
+      // 折叠标题行与内容之间的呼吸空间（宿主 DisclosureRow 与自绘版共用）
+      '.qp-gen-body{margin-top:6px}',
+      // 列表：一张紧凑的表，行之间用分割线而不是每条一个卡片
+      '.qp-gen-list{display:flex;flex-direction:column;border:0.5px solid var(--dsw-alias-border-l3);',
+      'border-radius:var(--dsw-radius-sm);overflow:hidden}',
+      '.qp-gen-item{border-bottom:0.5px solid var(--dsw-alias-border-l3)}',
+      '.qp-gen-item:last-child{border-bottom:0}',
+      '.qp-gen-row{display:flex;align-items:center;gap:10px;width:100%;min-width:0;padding:5px 10px;',
       'border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;',
-      'font-size:12px;line-height:18px;text-align:left;cursor:pointer}',
+      'font-size:12px;line-height:20px;text-align:left;cursor:pointer}',
       '.qp-gen-row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
       '.qp-gen-row:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));',
       'outline-offset:-2px}',
-      '.qp-gen-when{flex:none;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
-      '.qp-gen-model{flex:none;min-width:0;max-width:180px;overflow:hidden;text-overflow:ellipsis;',
+      '.qp-gen-when{flex:none;width:38px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
+      '.qp-gen-file{flex:0 1 120px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+      'color:var(--dsw-alias-label-quaternary, var(--dsw-alias-label-tertiary));',
+      'font-family:var(--dsh-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);font-size:11px}',
+      // 模型列收缩优先级最高（flex-shrink 3）：窄面板下先把空间让给文件名和文本
+      '.qp-gen-model{flex:0 3 150px;min-width:0;overflow:hidden;text-overflow:ellipsis;',
       'white-space:nowrap;color:var(--dsw-alias-label-secondary)}',
-      '.qp-gen-text{flex:1 1 160px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.qp-gen-meta{flex:none;margin-left:auto;color:var(--dsw-alias-label-tertiary);',
-      'font-variant-numeric:tabular-nums;white-space:nowrap}',
       '.qp-gen-badge{flex:none;padding:0 6px;border-radius:var(--dsw-radius-sm);',
       'background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-tertiary);',
       'font-size:11px;line-height:16px}',
       '.qp-gen-badge[data-src="model"]{color:var(--dsw-alias-label-secondary)}',
       '.qp-gen-badge[data-outcome]{color:var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-secondary));',
       'background:var(--dsw-alias-state-warning-fill, var(--dsw-alias-interactive-bg-hover))}',
-      '.qp-gen-detail{display:flex;flex-direction:column;gap:8px;padding:8px 12px 10px;',
+      '.qp-gen-text{flex:1 1 80px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      // 窄面板（web 版设置弹窗约 560px）：模型列让位给文本；完整路由仍在 hover title 与详情里
+      '@container (max-width: 640px){.qp-gen-model{display:none}}',
+      '.qp-gen-meta{flex:none;margin-left:auto;color:var(--dsw-alias-label-tertiary);font-size:11px;',
+      'font-variant-numeric:tabular-nums;white-space:nowrap}',
+      // 详情：缩进 + 顶部分割线，坐标走两列网格，多行内容走带标签的块
+      '.qp-gen-detail{display:flex;flex-direction:column;gap:10px;padding:10px 12px 12px 20px;',
       'border-top:0.5px solid var(--dsw-alias-border-l3)}',
-      '.qp-gen-detail dt{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}',
-      '.qp-gen-detail dd{margin:0 0 4px;font-size:12px;line-height:18px;',
-      'color:var(--dsw-alias-label-primary);white-space:pre-wrap;overflow-wrap:anywhere}',
+      '.qp-gen-kv{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:2px 14px;margin:0;',
+      'font-size:12px;line-height:20px}',
+      '.qp-gen-kv dt{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:20px}',
+      '.qp-gen-kv dd{margin:0;min-width:0;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere;',
+      'font-variant-numeric:tabular-nums}',
+      '.qp-gen-kv dd.qp-mono{font-family:var(--dsh-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);font-size:11.5px}',
+      '.qp-gen-block-label{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);margin-bottom:3px}',
+      '.qp-gen-main{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}',
       '.qp-gen-detail pre{margin:0;padding:8px 10px;border-radius:var(--dsw-radius-sm);',
-      'background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);',
-      'font-size:12px;line-height:18px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto}',
-      '.qp-gen-more{display:flex;justify-content:center;padding:4px 0 8px}',
-      '.qp-gen-locate{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}',
+      'background:var(--dsh-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);',
+      'font-size:12px;line-height:18px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}',
+      '.qp-gen-more{display:flex;justify-content:center;padding:6px 0 8px}',
+      '.qp-gen-locate{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
       '.qp-gen-cmd{flex:1 1 240px;min-width:0;margin:0;padding:6px 10px;border-radius:var(--dsw-radius-sm);',
       'background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);',
+      'font-family:var(--dsh-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);',
       'font-size:11px;line-height:16px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}',
     ].join('')
 
@@ -393,15 +466,6 @@ window.__ModuleLoader__.load({
     }
 
     // ---- turnTail 渲染 ----
-    const QUIP_MARK_SVG = h('svg', {
-      viewBox: '0 0 16 16', width: 12, height: 12, 'aria-hidden': 'true',
-      fill: 'none', stroke: 'currentColor', strokeWidth: 1.4,
-      strokeLinecap: 'round', strokeLinejoin: 'round',
-    },
-      h('path', { d: 'M6.5 2.5C4 3.3 2.5 5.4 2.5 8c0 2.2 1.1 3.7 2.6 4.4l-.7 1.6c-.1.3.1.6.4.6 2.9-.2 5.1-1.3 6.4-3.1' }),
-      h('path', { d: 'M6.5 2.5c.9-.3 1.9-.4 3-.2 2.6.5 4.4 2.7 4.4 5.4 0 1.5-.6 2.8-1.5 3.8' }),
-      h('path', { d: 'M5.5 7.5h.01M8.5 7.5h.01M11 7.5h.01' }))
-
     /**
      * 从 owner props 解析轮次号。
      * ui-chat 的 TurnTailOwnerProps.turn 是 TurnLocation 对象（{ turn, start,
@@ -443,7 +507,6 @@ window.__ModuleLoader__.load({
       if (quip === null) {
         return waiting
           ? h('div', { className: 'qp-tail', 'data-quip-turn': turn, 'data-quip-waiting': 'true', 'aria-label': tr('waiting') },
-              h('span', { className: 'qp-tail-mark', 'aria-hidden': 'true' }, QUIP_MARK_SVG),
               h('span', { className: 'qp-wait', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')))
           : null
       }
@@ -488,7 +551,6 @@ window.__ModuleLoader__.load({
         'data-quip-source': quip.source ?? '',
         title: detailBits.filter(Boolean).join(' · ') || undefined,
       },
-        h('span', { className: 'qp-tail-mark', 'aria-hidden': 'true' }, QUIP_MARK_SVG),
         h('span', { className: 'qp-tail-text' }, String(quip.text ?? '')))
     }
 
@@ -506,12 +568,26 @@ window.__ModuleLoader__.load({
         : ''
     }
 
-    /** 展开详情里的一个键值段。 */
-    function genDetailEntry(label, value) {
+    /** 紧凑键值网格里的一行（dt + dd）；空值不渲染。 */
+    function genKv(label, value, mono = false) {
       if (value === null || value === undefined || value === '') return null
-      return h('div', null,
-        h('dt', null, label),
-        h('dd', null, h('pre', null, typeof value === 'string' ? value : JSON.stringify(value, null, 2))))
+      return [
+        h('dt', { key: label + ':dt' }, label),
+        h('dd', { key: label + ':dd', className: mono ? 'qp-mono' : undefined }, typeof value === 'string' ? value : JSON.stringify(value)),
+      ]
+    }
+
+    /** 多行内容块：小标签 + 可滚动的 pre。 */
+    function genBlock(label, value) {
+      if (value === null || value === undefined || value === '') return null
+      return h('div', { className: 'qp-gen-block' },
+        h('div', { className: 'qp-gen-block-label' }, label),
+        h('pre', null, typeof value === 'string' ? value : JSON.stringify(value, null, 2)))
+    }
+
+    /** 行内显示的文件名：去掉 generations- 前缀与 .jsonl 后缀，只留时间戳（完整名在 title 与详情里）。 */
+    function fileLabel(file) {
+      return String(file).replace(/^generations-/, '').replace(/\.jsonl$/, '')
     }
 
     /**
@@ -532,10 +608,14 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 生成记录面板：每次生成的素材、提示词、原始输出、token 计量与成败。
-     * 折叠时零请求；展开后按需分页。
+     * 生成记录面板：紧凑列表（时间 / 所属文件 / 模型 / 来源 / 文本 / 用量），展开看定位坐标与素材。
+     * 折叠时零请求；展开后按需分页。「打开记录文件夹」走宿主的 session Remote——
+     * 省略 action 是直接进入目录（不是在父目录里选中它）。
+     * @param {{ status?: object, remote?: object | null }} props - 设置卡已拉取的 status（含 dataDir）与会话 Remote。
      */
-    function GenLogPanel() {
+    function GenLogPanel(props) {
+      const remote = props.remote ?? null
+      const dataDir = typeof props.status?.dataDir === 'string' && props.status.dataDir !== '' ? props.status.dataDir : null
       const [open, setOpen] = React.useState(false)
       const [records, setRecords] = React.useState(null)
       const [failed, setFailed] = React.useState(false)
@@ -543,6 +623,21 @@ window.__ModuleLoader__.load({
       const [expanded, setExpanded] = React.useState('')
       /** 复制定位命令后的按钮态：`${key}:ok` 已复制 / `${key}:fail` 复制失败；空串为空闲。 */
       const [copyState, setCopyState] = React.useState('')
+      /** 打开文件夹按钮态：'' 空闲 / opening / ok / fail。 */
+      const [folderState, setFolderState] = React.useState('')
+      /** 宿主是否能打开本地路径（Remote 探测）。 */
+      const [canOpen, setCanOpen] = React.useState(false)
+
+      React.useEffect(() => {
+        let alive = true
+        const probe = remote?.session?.canOpenWorkspacePath
+        if (typeof probe !== 'function') { setCanOpen(false); return () => { alive = false } }
+        Promise.resolve()
+          .then(() => probe.call(remote.session))
+          .then((result) => { if (alive) setCanOpen(result?.ok === true && result?.value === true) })
+          .catch(() => { if (alive) setCanOpen(false) })
+        return () => { alive = false }
+      }, [remote])
 
       const reload = React.useCallback((nextLimit) => {
         setFailed(false)
@@ -559,9 +654,23 @@ window.__ModuleLoader__.load({
         setOpen((current) => !current)
       }
       const onMore = () => {
-        const next = limit + 20
-        setLimit(next)
-        reload(next)
+        const nextLimit = limit + 20
+        setLimit(nextLimit)
+        reload(nextLimit)
+      }
+      const openable = canOpen && dataDir !== null && folderState !== 'opening'
+      const onOpenFolder = async () => {
+        if (!openable) return
+        setFolderState('opening')
+        try {
+          const opened = await remote.session.openWorkspacePath({ path: dataDir })
+          if (opened?.ok !== true) throw new Error('open failed')
+          setFolderState('ok')
+          setTimeout(() => setFolderState(''), 1500)
+        } catch {
+          setFolderState('fail')
+          setTimeout(() => setFolderState(''), 3000)
+        }
       }
 
       const onCopyLocate = (key, command) => {
@@ -581,80 +690,119 @@ window.__ModuleLoader__.load({
       const itemOf = (record) => {
         const key = `${record.ts}:${record.turn}`
         const usage = record.usage
+        // 行内用缩短格式（1153/892 · 6.5s）把宽度让给文本；完整格式进 hover title
         const metaBits = []
+        const metaTitle = []
         if (usage !== null && typeof usage === 'object') {
-          metaBits.push(tr('genTokens', { in: usage.inputTokens ?? 0, out: usage.outputTokens ?? 0 }))
+          metaBits.push(tr('genMetaTokens', { in: usage.inputTokens ?? 0, out: usage.outputTokens ?? 0 }))
+          metaTitle.push(tr('genTokens', { in: usage.inputTokens ?? 0, out: usage.outputTokens ?? 0 }))
         }
         if (Number.isFinite(record.durationMs) && record.durationMs > 0) {
-          metaBits.push(tr('genDuration', { ms: record.durationMs }))
+          metaBits.push(tr('genMetaDuration', { s: (record.durationMs / 1000).toFixed(1) }))
+          metaTitle.push(tr('genDuration', { ms: record.durationMs }))
         }
         const isOpen = expanded === key
         const command = locateCommandOf(record)
         const buttonState = copyState === `${key}:ok` ? 'ok' : copyState === `${key}:fail` ? 'fail' : ''
+        const filePath = dataDir !== null && typeof record.file === 'string' ? `${dataDir}/${record.file}` : (record.file ?? null)
+        const outcomeBadge = record.outcome !== undefined && record.outcome !== 'ok'
+          ? h('span', { className: 'qp-gen-badge', 'data-outcome': record.outcome, title: String(record.error ?? '') }, outcomeLabel(record.outcome))
+          : null
         return h('div', { className: 'qp-gen-item', key },
           h('button', {
             type: 'button', className: 'qp-gen-row', 'aria-expanded': isOpen ? 'true' : 'false',
+            // 整行 hover 显示路由：模型列在窄面板下隐藏时仍能看到
+            title: (String(record.provider ?? '?') + '/' + String(record.model ?? '')).replace(/\/$/, ''),
             onClick: () => { setExpanded(isOpen ? '' : key) },
           },
             h('span', { className: 'qp-gen-when' }, clockOf(record.ts)),
-            h('span', { className: 'qp-gen-model' },
+            record.file ? h('span', { className: 'qp-gen-file', title: filePath ?? record.file }, fileLabel(record.file)) : null,
+            h('span', { className: 'qp-gen-model', title: `${record.provider ?? ''}/${record.model ?? ''}` },
               `${record.provider ?? record.request?.provider ?? '?'}/${record.model ?? record.request?.model ?? ''}`.replace(/\/$/, '')),
             h('span', { className: 'qp-gen-badge', 'data-src': record.source ?? '' }, sourceLabel(record.source)),
-            record.outcome !== undefined && record.outcome !== 'ok'
-              ? h('span', { className: 'qp-gen-badge', 'data-outcome': record.outcome }, outcomeLabel(record.outcome))
-              : null,
-            h('span', { className: 'qp-gen-text' }, String(record.cleaned ?? record.raw ?? record.error ?? '')),
-            metaBits.length > 0 ? h('span', { className: 'qp-gen-meta' }, metaBits.join(' · ')) : null),
-          isOpen ? h('dl', { className: 'qp-gen-detail' },
-            // 会话日志定位坐标：有 seq 就能直接命中会话文件里那一行
-            genDetailEntry(tr('genTurnLabel'), record.turn),
-            genDetailEntry(tr('genSeq'), record.recordSeq ?? tr('genNotPersisted')),
-            genDetailEntry(tr('genStep'), record.step),
-            genDetailEntry(tr('genMsgId'), record.messageId),
-            genDetailEntry(tr('genAfterSeq'), record.afterSeq),
-            genDetailEntry(tr('genResult'), record.cleaned),
-            genDetailEntry(tr('genRaw'), record.raw),
-            genDetailEntry(tr('genMaterial'), record.material),
-            genDetailEntry(tr('genPrompt'), record.systemPrompt),
-            genDetailEntry(tr('genUsage'), record.usage),
-            genDetailEntry(tr('genError'), record.error),
-            genDetailEntry('session', record.session),
+            outcomeBadge,
+            h('span', { className: 'qp-gen-text' }, String(record.text ?? record.error ?? '')),
+            metaBits.length > 0 ? h('span', { className: 'qp-gen-meta', title: metaTitle.join(' · ') }, metaBits.join(' · ')) : null),
+          isOpen ? h('div', { className: 'qp-gen-detail' },
+            // 主内容：用户最终看到的那句（模型原文或兜底句），来源看行内徽章
+            h('div', { className: 'qp-gen-block' },
+              h('div', { className: 'qp-gen-block-label' }, tr('genText')),
+              h('div', { className: 'qp-gen-main' }, String(record.text ?? ''))),
+            // 定位坐标：紧凑两列网格
+            h('dl', { className: 'qp-gen-kv' },
+              genKv(tr('genTurnLabel'), record.turn),
+              genKv(tr('genSeq'), record.recordSeq ?? tr('genNotPersisted')),
+              genKv(tr('genStep'), record.step),
+              genKv(tr('genMsgId'), record.messageId, true),
+              genKv(tr('genAfterSeq'), record.afterSeq),
+              genKv(tr('genFile'), filePath, true),
+              genKv(tr('genUsage'), usage && typeof usage === 'object'
+                ? tr('genUsageFull', { in: usage.inputTokens ?? 0, out: usage.outputTokens ?? 0, total: usage.totalTokens ?? ((usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)) })
+                : null),
+              genKv(tr('genDurationLabel'), Number.isFinite(record.durationMs) ? tr('genDuration', { ms: record.durationMs }) : null),
+              genKv('session', record.session, true)),
+            genBlock(tr('genMaterial'), record.material),
+            genBlock(tr('genPrompt'), record.systemPrompt),
+            genBlock(tr('genError'), record.error),
             command !== ''
               ? h('div', { className: 'qp-gen-locate' },
-                h('code', { className: 'qp-gen-cmd' }, command),
-                h('button', {
-                  type: 'button', className: 'qp-btn', 'data-copy': buttonState,
-                  onClick: () => { onCopyLocate(key, command) },
-                }, buttonState === 'ok' ? tr('genCopied') : buttonState === 'fail' ? tr('genCopyFailed') : tr('genLocate')))
+                  h('code', { className: 'qp-gen-cmd' }, command),
+                  h('button', {
+                    type: 'button', className: 'qp-btn', 'data-copy': buttonState,
+                    onClick: () => { onCopyLocate(key, command) },
+                  }, buttonState === 'ok' ? tr('genCopied') : buttonState === 'fail' ? tr('genCopyFailed') : tr('genLocate')))
               : null)
           : null)
       }
 
-      return h('div', { className: 'qp-card' },
-        h('div', { className: 'qp-gen-head' },
-          h('span', null, tr('genToggle')),
-          h('button', {
-            type: 'button', className: 'qp-btn', onClick: onToggle,
-            'aria-expanded': open ? 'true' : 'false',
-          }, open ? '×' : '▾')),
-        open
-          ? (failed
-              ? h('span', { className: 'qp-hint' }, tr('loadFailed'))
-              : records === null
-                ? h('span', { className: 'qp-hint' }, tr('loading'))
-                : records.length === 0
-                  ? h('span', { className: 'qp-hint' }, tr('genEmpty'))
-                  : h('div', { className: 'qp-gen-list' },
-                    records.map(itemOf),
-                    records.length >= limit
-                      ? h('div', { className: 'qp-gen-more' },
-                        h('button', { type: 'button', className: 'qp-btn', onClick: onMore }, tr('genShowMore')))
-                      : null))
-          : null)
-    }
+      const folderButton = makeButton({
+        disabled: !openable,
+        title: dataDir ?? tr('genOpenFailed'),
+        onClick: () => { void onOpenFolder() },
+      }, folderState === 'opening' ? '…' : folderState === 'ok' ? tr('genOpened') : folderState === 'fail' ? tr('genOpenFailed') : tr('genOpenFolder'))
 
+      const body = open
+          ? (failed
+              ? h('span', { className: 'qp-gen-hint' }, tr('loadFailed'))
+              : records === null
+                ? h('span', { className: 'qp-gen-hint' }, tr('loading'))
+                : records.length === 0
+                  ? h('span', { className: 'qp-gen-hint' }, tr('genEmpty'))
+                  : h('div', { className: 'qp-gen-list' },
+                      records.map(itemOf),
+                      records.length >= limit
+                        ? h('div', { className: 'qp-gen-more' },
+                            h('button', { type: 'button', className: 'qp-btn', onClick: onMore }, tr('genShowMore')))
+                        : null))
+          : null
+      // 展开后说明保留策略：不会自动清理，想删就去目录里删文件
+      const hint = open && records !== null && records.length > 0 ? h('div', { className: 'qp-gen-hint' }, tr('genFolderHint')) : null
+
+      // 标题行：有宿主的 DisclosureRow 就用它（和对话里「思考过程」折叠行同一套交互与样式），
+      // 整行可点、折叠时图标 hover 出 chevron、展开时 chevron 朝上；没有则用本包自绘的等价结构
+      if (DisclosureRow !== null) {
+        return h('div', { className: 'qp-card' },
+          h(DisclosureRow, {
+            icon: GEN_LIST_ICON, title: tr('genToggle'), open, expandable: true, expandOnRowClick: true,
+            onToggle, headerAccessory: open ? folderButton : null,
+          }, body === null && hint === null ? null : h('div', { className: 'qp-gen-body' }, body, hint)))
+      }
+      return h('div', { className: 'qp-card' },
+        h('div', {
+          className: 'qp-gen-head', role: 'button', tabIndex: 0, 'aria-expanded': open ? 'true' : 'false',
+          'aria-label': tr('genToggle'),
+          onClick: onToggle,
+          onKeyDown: (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onToggle() } },
+        },
+          h('span', { className: 'qp-gen-head-title' }, GEN_LIST_ICON, tr('genToggle')),
+          // 右侧按钮组不冒泡到标题行，否则点「打开记录文件夹」会顺手把面板收起
+          h('div', { className: 'qp-gen-head-actions', role: 'presentation', onClick: (event) => event.stopPropagation() },
+            open ? folderButton : null,
+            h('span', { className: 'qp-gen-chevron', 'data-open': open ? 'true' : undefined, 'aria-hidden': 'true' }, CHEVRON_ICON))),
+        body === null && hint === null ? null : h('div', { className: 'qp-gen-body' }, body, hint))
+    }
     /** 设置卡组件。 */
-    function QuipSettings() {
+    function QuipSettings(props) {
       const [status, setStatus] = React.useState(null)
       const [failed, setFailed] = React.useState(false)
       const [draft, setDraft] = React.useState(null)
@@ -816,17 +964,14 @@ window.__ModuleLoader__.load({
             })),
           // 固定模型行只在关闭跟随时出现（跟随时由会话决定，配置值不参与）
           draft.followSessionModel === false
-            ? h('div', { className: 'qp-row' },
+            ? h('div', { className: 'qp-row qp-row--top' },
                 h('div', { className: 'qp-row-copy' },
                   h('span', null, tr('model')),
                   h('span', { className: 'qp-hint' }, tr('modelFixedHint'))),
                 h('div', { className: 'qp-actions' },
                   modelSelect,
                   reasoningSelect,
-                  h('button', {
-                    type: 'button', className: 'qp-btn', onClick: reload,
-                    'aria-label': tr('reload'),
-                  }, '⟳')))
+                  makeButton({ onClick: reload, title: tr('reload'), 'aria-label': tr('reload') }, tr('genRefresh'))))
             : null,
           h('div', { className: 'qp-divider' }),
           h('div', { className: 'qp-row' },
@@ -846,11 +991,12 @@ window.__ModuleLoader__.load({
         // 必须作为元素渲染而不是直接调用：GenLogPanel 自带 hooks，直接调用
         // 会让它的 hooks 挂进 QuipSettings 的渲染，loading 态提前 return 时
         // hooks 缺失 → 顺序违规 → 设置卡崩溃空白（0.2.2 修复）
-        h(GenLogPanel))
+        h(GenLogPanel, { status, remote: props.remote ?? null }))
     }
 
     return {
-      inject: ['slots'],
+      // remote / remote.session：面板「打开记录文件夹」经宿主的 session Remote 打开本地目录
+      inject: ['slots', 'remote', 'remote.session'],
       apply(ctx) {
         // 样式常驻（挂 document.head，随插件卸载移除），不随组件挂载/卸载
         ctx.effect(() => {
@@ -871,7 +1017,7 @@ window.__ModuleLoader__.load({
         // 设置页卡片（label 用 thunk，跟随活跃语言重读）
         ctx.slots.inject('settings.section', () => ctx.slots.register(
           { name: 'settings.section', id: SECTION_ID, order: SECTION_ORDER, label: () => tr('settingsNav') },
-          QuipSettings,
+          (slotProps) => h(QuipSettings, { ...slotProps, remote: ctx.remote }),
         ))
       },
     }

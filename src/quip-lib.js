@@ -1,5 +1,5 @@
 /**
- * 俏皮话的素材工具：事件折叠、脱敏与生成结果清洗。
+ * 俏皮话的素材工具：事件折叠与脱敏。
  *
  * 「素材」是喂给生成模型的一轮上下文摘要：用户这轮的发言、助手输出的
  * 正文摘要、工具调用统计与轮次时长。全部来自已提交的 `session/event`
@@ -189,33 +189,4 @@ export function renderMaterial(material, options = {}) {
   lines.push(`【本轮耗时】约 ${seconds} 秒，${material.steps} 次模型步骤，结束原因 ${material.endedReason || 'completed'}`)
   lines.push('请依据以上素材，按系统指令输出一句话。')
   return lines.join('\n\n')
-}
-
-/**
- * 清洗生成模型的原始输出：去包裹引号与首尾空白，只取第一行。
- * **不截断**：完整展示是硬需求，请求层也不设 maxTokens（带思考的模型会被
- * 思考挤爆配额）；长度只靠系统提示里的 maxChars 约束，超了照常完整显示。
- * 只取第一行是格式清洗（系统提示要求不换行），不是长度截断。
- * @param {string} raw - 模型输出的拼接文本。
- * @returns {string} 清洗后的一句话；空串表示放弃。
- */
-export function cleanQuipText(raw) {
-  if (typeof raw !== 'string') return ''
-  let text = raw.trim()
-  if (text === '') return ''
-  // 只取第一行（规则说不换行，防御性处理），再去掉包裹整句的一对引号；
-  // 「（叉腰）这波稳了」这类首部的动作描写括号不成对包裹整句，保留。
-  const firstLine = text.split(/\r?\n/, 1)[0].trim()
-  if (firstLine !== '') text = firstLine
-  const wraps = [['「', '」'], ['『', '』'], ['（', '）'], ['“', '”'], ['"', '"'], ["'", "'"], ['(', ')']]
-  for (const [open, close] of wraps) {
-    if (text.length >= 2 && text.startsWith(open) && text.endsWith(close)) {
-      const inner = text.slice(1, -1).trim()
-      if (inner !== '') {
-        text = inner
-        break
-      }
-    }
-  }
-  return text
 }

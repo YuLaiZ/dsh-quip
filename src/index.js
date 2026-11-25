@@ -8,7 +8,8 @@
  *    独立的已注册模型小调用（`ctx.llm.stream`）生成一句自评。
  * 3. 生成结果写三处：内存（供端点与 SSE 读）、会话日志 plugin record
  *    （持久层真相源：重启后冷读恢复、fork/导出携带、任何遍历会话事件的
- *    统计工具都能取到 token usage）、生成过程记录（jsonl，供设置卡查看）。
+ *    统计工具都能取到 token usage）、生成过程记录（按 500 条分文件的 jsonl，
+ *    永久保留，供设置卡查看；用户可在设置卡打开目录自行删除）。
  * 4. 通过 `ctx.webServer.register` 开放同源端点：
  *    - GET  /api/quip/v1/health              匿名；运行态与持久化诊断
  *    - GET  /api/quip/v1/status              匿名；配置 + provider/model 目录
@@ -30,7 +31,7 @@ import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
-import { mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync } from 'node:fs'
 import {
   CUSTOM_STYLE_ID,
   SKIP_SENTINEL,
@@ -39,7 +40,6 @@ import {
   fallbackPoolOf,
 } from './styles.js'
 import {
-  cleanQuipText,
   foldEvent,
   freshTurnMaterial,
   materialWorthQuip,
@@ -104,15 +104,124 @@ function generationTimeoutMs() {
 }
 /** SSE 心跳间隔（毫秒），低于常见代理空闲超时。 */
 const SSE_HEARTBEAT_MS = 25_000
-/** 生成过程记录：内存环形上限与 jsonl 滚动上限。 */
-const GEN_MEMORY_LIMIT = 200
+/**
+ * 生成过程记录：内存保留上限与单文件滚动上限（条）。
+ * 磁盘上永久保留、只追加不重写：写满一个文件就换下一个，用户可在设置卡打开
+ * 记录目录自行删除；内存只留最近 GEN_MEMORY_LIMIT 条供面板查询。
+ */
+const GEN_MEMORY_LIMIT = 500
 const GEN_FILE_LIMIT = 500
-/** 生成过程记录的磁盘文件（默认 $DSH_HOME/quip/；QUIP_DATA_DIR 可覆盖，测试用）。 */
+/**
+ * 生成过程记录目录（默认 $DSH_HOME/quip/；QUIP_DATA_DIR 可覆盖，测试用）。
+ * 记录文件放在其下的 generations/ 子目录，每个文件最多 GEN_FILE_LIMIT 条。
+ */
 const DATA_DIR = process.env.QUIP_DATA_DIR
   ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'quip')
-const GEN_FILE = join(DATA_DIR, 'generations.jsonl')
+const GEN_DIR = join(DATA_DIR, 'generations')
+/** 旧版单文件布局；首次启动时整体迁移进 GEN_DIR（不解析、不改内容）。 */
+const LEGACY_GEN_FILE = join(DATA_DIR, 'generations.jsonl')
+/** 文件名 = 该文件首条记录的本地时间，按名字排序即时间顺序；迁移撞名时带 -N 后缀。 */
+const GEN_FILE_PREFIX = 'generations-'
+const GEN_FILE_RE = /^generations-(\d{8}-\d{6})(?:-\d+)?\.jsonl$/
 /** 本包版本（health 端点与日志用；与 package.json 同步）。 */
 const VERSION = '0.6.0'
+
+// ---- 生成过程记录文件（纯函数，不依赖 ctx） ----
+
+/** 本地时间 YYYYMMDD-HHmmss（文件名用；本地时区与用户在文件管理器里看到的一致）。 */
+function generationStamp(ts) {
+  const d = new Date(ts)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+}
+
+/**
+ * 解析一行生成记录；坏行返回 null。
+ * 旧版字段归一化：raw（模型原文）/ cleaned（最终文本）合并为 text（用户最终看到的），
+ * 缺 file（所属文件）时补上所在文件名。
+ * @param {string} line - 一行 JSON。
+ * @param {string} fileName - 所在文件名。
+ * @returns {Record<string, unknown> | null}
+ */
+function parseGenerationLine(line, fileName) {
+  let record
+  try { record = JSON.parse(line) } catch { return null }
+  if (record === null || typeof record !== 'object') return null
+  if (typeof record.text !== 'string') {
+    record.text = typeof record.cleaned === 'string' ? record.cleaned : typeof record.raw === 'string' ? record.raw : ''
+  }
+  delete record.raw
+  delete record.cleaned
+  if (typeof record.file !== 'string' || record.file === '') record.file = fileName
+  return record
+}
+
+/** 记录目录里的文件名，按时间升序（旧 → 新）；目录不存在时为空。 */
+function listGenerationFiles() {
+  let names
+  try { names = readdirSync(GEN_DIR) } catch { return [] }
+  return names.filter((name) => GEN_FILE_RE.test(name)).sort()
+}
+
+/**
+ * 目录签名：文件名 + 大小 + mtime。用户在文件管理器里增删文件后签名会变，
+ * 查询端点据此重载内存缓存，不必重启。
+ */
+function generationDirSignature() {
+  try {
+    return listGenerationFiles()
+      .map((name) => {
+        const stat = statSync(join(GEN_DIR, name))
+        return `${name}:${stat.size}:${Math.trunc(stat.mtimeMs)}`
+      })
+      .join('|')
+  } catch { return '' }
+}
+
+/** 读一个记录文件，返回解析后的记录（追加顺序：旧 → 新）；不可读时为空。 */
+function readGenerationFile(name) {
+  let text
+  try { text = readFileSync(join(GEN_DIR, name), 'utf8') } catch { return [] }
+  const out = []
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') continue
+    const record = parseGenerationLine(line, name)
+    if (record !== null) out.push(record)
+  }
+  return out
+}
+
+/** 从磁盘加载最近 GEN_MEMORY_LIMIT 条（最近在前）：从最新文件倒着读，跨文件凑数。 */
+function loadGenerations() {
+  const out = []
+  for (const name of listGenerationFiles().reverse()) {
+    const records = readGenerationFile(name)
+    for (let i = records.length - 1; i >= 0 && out.length < GEN_MEMORY_LIMIT; i--) out.push(records[i])
+    if (out.length >= GEN_MEMORY_LIMIT) break
+  }
+  return out
+}
+
+/**
+ * 旧版单文件 generations.jsonl → 迁移进 GEN_DIR，文件名取首条记录的时间
+ * （首行损坏则取文件 mtime）；目标撞名时带 -N 后缀。只 rename，不解析内容。
+ * @returns {boolean} 是否发生了迁移。
+ */
+function migrateLegacyGenerationFile() {
+  if (!existsSync(LEGACY_GEN_FILE)) return false
+  mkdirSync(GEN_DIR, { recursive: true })
+  let stamp = null
+  try {
+    const firstLine = readFileSync(LEGACY_GEN_FILE, 'utf8').split('\n').find((line) => line.trim() !== '')
+    const ts = firstLine === undefined ? NaN : JSON.parse(firstLine)?.ts
+    if (Number.isFinite(ts)) stamp = generationStamp(ts)
+  } catch { /* 首行损坏：下面退回 mtime */ }
+  if (stamp === null) stamp = generationStamp(statSync(LEGACY_GEN_FILE).mtimeMs)
+  let target = join(GEN_DIR, `${GEN_FILE_PREFIX}${stamp}.jsonl`)
+  for (let n = 2; existsSync(target); n++) target = join(GEN_DIR, `${GEN_FILE_PREFIX}${stamp}-${n}.jsonl`)
+  renameSync(LEGACY_GEN_FILE, target)
+  return true
+}
 
 // ---- 会话日志 plugin record ----
 
@@ -540,26 +649,28 @@ export function apply(ctx, config) {
   const sessionModels = new Map()
   /** 进行中的生成任务（防同轮重复）。 */
   const generating = new Set()
-  /** 生成过程记录（内存环形，最近在前）。 */
+  /**
+   * 生成过程记录（内存，最近在前）：启动从磁盘加载最近 GEN_MEMORY_LIMIT 条，
+   * 查询端点发现目录变化（用户增删文件）时重载。磁盘上按文件永久保留。
+   */
   let generations = []
+  /** 上次加载时的目录签名；与现状不一致就重载。 */
+  let generationSignature = ''
+  /** 当前写入文件 { name, count }；首次写入时从目录恢复。 */
+  let generationSink = null
   /** 会话日志写入器：首次需要时解析并缓存。 */
   let writerPromise = null
-  /** 启动即从磁盘载入最近的生成过程记录。 */
+  // 旧版单文件先整体搬进记录目录（只 rename），再加载；迁移失败不阻塞，旧文件原样保留
+  let migratedLegacy = false
   try {
-    const lines = readFileSync(GEN_FILE, 'utf8').split('\n')
-      .filter((line) => line.trim() !== '')
-      .map((line) => {
-        try { return JSON.parse(line) } catch { return null }
-      })
-      .filter(Boolean)
-    generations = lines.slice(-GEN_MEMORY_LIMIT).reverse()
-    ctx.logger.info(`${PLUGIN_TAG}: loaded ${generations.length} generation records`)
+    migratedLegacy = migrateLegacyGenerationFile()
   } catch (error) {
-    // 文件不存在是首次运行的正常状态；其他读取错误要可见。
-    if (error?.code !== 'ENOENT') {
-      ctx.logger.warn(`${PLUGIN_TAG}: generation log unreadable (%s): %s`, error?.code ?? describeError(error).name, describeError(error).message)
-    }
+    ctx.logger.warn(`${PLUGIN_TAG}: legacy generation log not migrated (%s): %s`,
+      describeError(error).name, describeError(error).message)
   }
+  generations = loadGenerations()
+  generationSignature = generationDirSignature()
+  ctx.logger.info(`${PLUGIN_TAG}: loaded ${generations.length} generation records from ${listGenerationFiles().length} file(s)${migratedLegacy ? ' (legacy file migrated)' : ''}`)
 
   /**
    * 会话日志写入的可观测状态。持久化失败曾被 debug 级日志静默吞掉，
@@ -584,31 +695,48 @@ export function apply(ctx, config) {
     lastError: null,
   }
 
+  /** 当前写入文件：接着目录里最新的文件写（不足 GEN_FILE_LIMIT 条），否则下一条新建。 */
+  function resolveGenerationSink() {
+    const latest = listGenerationFiles().at(-1)
+    if (latest !== undefined) {
+      const count = readGenerationFile(latest).length
+      if (count < GEN_FILE_LIMIT) return { name: latest, count }
+    }
+    return { name: null, count: GEN_FILE_LIMIT }
+  }
+
   /**
-   * 追加一条生成过程记录：内存环形 + jsonl 落盘（超限时 compact 截断）。
+   * 追加一条生成记录：写进当前文件，写满就换一个新文件（文件名 = 这条记录的时间）。
+   * 磁盘只追加、不重写；内存只留最近 GEN_MEMORY_LIMIT 条。
    * 落盘失败必须可见——它和会话日志写入失败一样，是「用户要的数据没写进去」。
-   * @param {Record<string, unknown>} record - 完整生成过程。
+   * @param {Record<string, unknown>} record - 完整生成过程；写入前补上 file（所属文件名）。
    */
   function recordGeneration(record) {
-    generations.unshift(record)
-    if (generations.length > GEN_MEMORY_LIMIT) generations.length = GEN_MEMORY_LIMIT
     try {
-      mkdirSync(DATA_DIR, { recursive: true })
-      appendFileSync(GEN_FILE, `${JSON.stringify(record)}\n`)
-      compactGenerationFile()
+      mkdirSync(GEN_DIR, { recursive: true })
+      generationSink ??= resolveGenerationSink()
+      if (generationSink.name === null || generationSink.count >= GEN_FILE_LIMIT) {
+        generationSink = { name: `${GEN_FILE_PREFIX}${generationStamp(record.ts)}.jsonl`, count: 0 }
+      }
+      record.file = generationSink.name
+      appendFileSync(join(GEN_DIR, generationSink.name), `${JSON.stringify(record)}\n`)
+      generationSink.count += 1
+      generations.unshift(record)
+      if (generations.length > GEN_MEMORY_LIMIT) generations.length = GEN_MEMORY_LIMIT
+      generationSignature = generationDirSignature()
     } catch (error) {
       ctx.logger.warn(`${PLUGIN_TAG}: generation log append failed (%s): %s`,
         describeError(error).name, describeError(error).message)
     }
   }
 
-  /** jsonl 滚动重写：保留最近 GEN_FILE_LIMIT 条。 */
-  function compactGenerationFile() {
-    try {
-      const lines = readFileSync(GEN_FILE, 'utf8').split('\n').filter((line) => line.trim() !== '')
-      if (lines.length <= GEN_FILE_LIMIT) return
-      writeFileSync(GEN_FILE, `${lines.slice(-GEN_FILE_LIMIT).join('\n')}\n`)
-    } catch { /* 文件不存在或不可读：下次追加时重试 */ }
+  /** 目录变了（用户在文件管理器里增删文件）就从磁盘重载内存缓存；写入游标一并重解析。 */
+  function reconcileGenerations() {
+    const signature = generationDirSignature()
+    if (signature === generationSignature) return
+    generations = loadGenerations()
+    generationSignature = signature
+    generationSink = null
   }
 
   /**
@@ -865,8 +993,14 @@ export function apply(ctx, config) {
       routeSource: sessionSelection !== undefined ? 'session' : 'config',
       material: materialText.slice(0, 2000),
       systemPrompt,
-      raw: '',
-      cleaned: '',
+      /**
+       * 用户最终看到的那句话，与写进会话日志的 message.content[0].text 完全相同：
+       * 模型生成 → 模型原文（仅去首尾空白，不剥引号、不截首行）；兜底 → 兜底池抽出的那句。
+       * 谁产生的看 source；模型失败且未开兜底时为空串，原因看 error。
+       */
+      text: '',
+      /** 所属记录文件名（recordGeneration 写入前填上；面板据此告诉用户去哪删）。 */
+      file: null,
       /** 模型调用的结局：ok / timeout / aborted / error / skip / no-provider。 */
       outcome: 'error',
       /** 最终文本的来源：model / fallback / no-provider / skip。 */
@@ -896,35 +1030,31 @@ export function apply(ctx, config) {
             signal: controller.signal,
             sessionId,
           }), controller.signal)
-          trace.raw = result.text
           trace.usage = result.usage
           // 流以 error 结束（或带着 error chunk）时，即使没抛异常也必须记失败
           if (result.error !== null && result.error !== undefined) throw result.error
+          // 模型原文只去首尾空白：用户要求看到的就是模型真实输出的内容，不再剥引号、不再截首行
+          const modelText = typeof result.text === 'string' ? result.text.trim() : ''
           if (result.aborted) {
             trace.outcome = timedOut ? 'timeout' : 'aborted'
             trace.error = timedOut ? `generation exceeded ${timeoutMs} ms` : 'generation aborted'
           } else if (result.text.includes(SKIP_SENTINEL)) {
-            // 哨兵检查在清洗之前：整句括号会被 cleanQuipText 剥掉。
-            // 模型自己判定素材不足：尊重它，不用兜底池。
+            // 模型自己判定素材不足：尊重它，不用兜底池；哨兵原文留在 text 里供面板查看。
             trace.outcome = 'skip'
             trace.source = 'skip'
-            trace.cleaned = result.text.trim()
+            trace.text = modelText
             return
+          } else if (modelText !== '') {
+            text = modelText
+            source = 'model'
+            trace.outcome = 'ok'
           } else {
-            const cleaned = cleanQuipText(result.text)
-            trace.cleaned = cleaned
-            if (cleaned !== '') {
-              text = cleaned
-              source = 'model'
-              trace.outcome = 'ok'
-            } else {
-              // 流正常结束但没有任何可用文本：额度耗尽、鉴权失败、被上游内容策略
-              // 拦截等都会长这样。曾把它记成 ok，导致真实失败在生成记录里完全不可见。
-              trace.outcome = 'empty'
-              trace.error = `model returned no text (finish=${result.finishReason ?? 'none'}, usage=${result.usage === null ? 'none' : JSON.stringify(result.usage)})`
-              ctx.logger.warn(`${PLUGIN_TAG}: %s/%s returned no text (finish=%s)`,
-                route.provider, route.model ?? '(default)', result.finishReason ?? 'none')
-            }
+            // 流正常结束但没有任何可用文本：额度耗尽、鉴权失败、被上游内容策略
+            // 拦截等都会长这样。曾把它记成 ok，导致真实失败在生成记录里完全不可见。
+            trace.outcome = 'empty'
+            trace.error = `model returned no text (finish=${result.finishReason ?? 'none'}, usage=${result.usage === null ? 'none' : JSON.stringify(result.usage)})`
+            ctx.logger.warn(`${PLUGIN_TAG}: %s/%s returned no text (finish=%s)`,
+              route.provider, route.model ?? '(default)', result.finishReason ?? 'none')
           }
         } catch (error) {
           trace.outcome = 'error'
@@ -943,7 +1073,7 @@ export function apply(ctx, config) {
       }
       if (text !== '') {
         trace.source = source
-        trace.cleaned = text
+        trace.text = text
         const durationMs = Date.now() - startedAt
         trace.durationMs = durationMs
         // 写进会话日志的 record：**按 DSH 原生 assistant/message 的形状组织**，
@@ -1079,22 +1209,69 @@ export function apply(ctx, config) {
     }
     if (type === 'turn/end') {
       const material = folding.get(sessionId)
-      if (material === undefined) return
+      if (material === undefined) {
+        // 内存里没有这一轮的素材：插件在轮次中途重载 / 重启过（folding 被清空）。
+        // 从会话日志把这轮的事件补折回来，否则这一轮的俏皮话就丢了。
+        void rebuildMaterialFromLog(session, event.data?.turn).then((rebuilt) => {
+          if (rebuilt !== null) finishTurn(session, rebuilt, event)
+        })
+        return
+      }
       folding.delete(sessionId)
-      // 结束原因与 turn/end 的 seq（record.after 的直接前驱锚点）都由 foldEvent 记
-      foldEvent(material, event)
-      const reason = event.data?.reason?.kind ?? 'completed'
-      const conf = currentConfig(config)
-      if (!conf.enabled) return
-      const interrupted = reason === 'aborted' || reason === 'interrupted'
-      if (reason !== 'completed' && !(interrupted && conf.includeInterrupted)) return
-      if (!materialWorthQuip(material)) return
-      void generate(session, material)
+      finishTurn(session, material, event)
       return
     }
     const material = folding.get(sessionId)
     if (material !== undefined) foldEvent(material, event)
   })
+
+  /**
+   * 轮次收尾：折进 turn/end、按配置与结束原因决定是否生成。
+   * @param {object} session - 宿主 Session 实例。
+   * @param {import('./quip-lib.js').TurnMaterial} material - 本轮素材（实时折叠或从日志补折）。
+   * @param {{ type: string, seq?: number, time?: number, data?: any }} event - 本轮的 turn/end 事件。
+   */
+  function finishTurn(session, material, event) {
+    // 结束原因与 turn/end 的 seq（record.after 的直接前驱锚点）都由 foldEvent 记
+    foldEvent(material, event)
+    const reason = event.data?.reason?.kind ?? 'completed'
+    const conf = currentConfig(config)
+    if (!conf.enabled) return
+    const interrupted = reason === 'aborted' || reason === 'interrupted'
+    if (reason !== 'completed' && !(interrupted && conf.includeInterrupted)) return
+    if (!materialWorthQuip(material)) return
+    void generate(session, material)
+  }
+
+  /**
+   * 从会话日志补折一轮素材：找到本轮的 turn/start，把它之后（含本轮 turn/end，若已持久化）
+   * 的事件重新 foldEvent 一遍。上一轮的 quip record 等 plugin 事件会被 foldEvent 忽略。
+   * @param {object} session - 宿主 Session 实例。
+   * @param {unknown} turn - 本轮轮次号。
+   * @returns {Promise<import('./quip-lib.js').TurnMaterial | null>} 补折后的素材；日志不可读或找不到本轮时为 null。
+   */
+  async function rebuildMaterialFromLog(session, turn) {
+    if (!Number.isInteger(turn)) return null
+    const sessionQuery = ctx.get('sessionQuery')
+    if (sessionQuery === undefined || typeof sessionQuery.readSession !== 'function') return null
+    try {
+      const snapshot = await sessionQuery.readSession(session.id)
+      const events = Array.isArray(snapshot?.events) ? snapshot.events : []
+      let start = -1
+      for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i]?.type === 'turn/start' && events[i]?.data?.turn === turn) { start = i; break }
+      }
+      if (start < 0) return null
+      const material = freshTurnMaterial()
+      for (let i = start; i < events.length; i++) foldEvent(material, events[i])
+      ctx.logger.info(`${PLUGIN_TAG}: material for turn ${turn} rebuilt from session log (${events.length - start} events)`)
+      return material
+    } catch (error) {
+      ctx.logger.warn(`${PLUGIN_TAG}: material rebuild for turn ${turn} failed (%s): %s`,
+        describeError(error).name, describeError(error).message)
+      return null
+    }
+  }
 
   // 清理会话状态（Session 离开注册表时）
   ctx.on('session/disposed', (session) => {
@@ -1177,11 +1354,13 @@ export function apply(ctx, config) {
       kind: 'exact',
       path: `${API_PREFIX}/generations`,
       handler: (req, res) => {
+        // 用户可能刚在文件管理器里删了记录文件：目录一变就重载，面板不必等重启
+        reconcileGenerations()
         const sessionId = sessionParam(req)
         let limit = 20
         try {
           const value = Number(new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('limit'))
-          if (Number.isFinite(value) && value > 0) limit = Math.min(200, Math.round(value))
+          if (Number.isFinite(value) && value > 0) limit = Math.min(GEN_MEMORY_LIMIT, Math.round(value))
         } catch { /* 用默认值 */ }
         const records = (sessionId === null
           ? generations
@@ -1245,6 +1424,15 @@ export function apply(ctx, config) {
           } catch { /* 单个 provider 失败不拖垮整个目录 */ }
           providers.push(entry)
         }
+        /**
+         * 记录目录的真实路径：面板「打开记录文件夹」把它交给宿主在系统文件管理器里打开。
+         * 必须 realpath——宿主要求路径解析后与传入值一致，符号链接会被拒；目录不可用时为 null（按钮禁用）。
+         */
+        let dataDir = null
+        try {
+          mkdirSync(GEN_DIR, { recursive: true })
+          dataDir = realpathSync(GEN_DIR)
+        } catch { /* 目录不可用：面板按钮禁用 */ }
         sendJson(res, 200, {
           config: conf,
           providers,
@@ -1252,6 +1440,7 @@ export function apply(ctx, config) {
           sessions: quips.size,
           /** 已跟踪到模型选择的会话（followSessionModel 开启时，生成就用这里的模型）。 */
           sessionModels: Object.fromEntries(sessionModels),
+          dataDir,
         })
       },
     })

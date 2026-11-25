@@ -70,15 +70,16 @@ Web 版与桌面版各自独立安装，profile 互不相通。本插件目前�
 
 ### 生成记录
 
-设置卡下方的「查看生成记录」可展开最近生成的素材（已脱敏）、系统提示词、模型原始输出、token 计量、耗时、结局与错误；非 ok 的结局带警告徽章。同时落盘到 `$DSH_HOME/quip/generations.jsonl`（滚动 500 条），该文件是插件自有文件，不随 fork / 导出。
+设置卡下方的「查看生成记录」可展开最近生成的素材（已脱敏）、系统提示词、文本、token 用量、耗时、结局与错误；非 ok 的结局带警告徽章。记录按 500 条一个文件永久保存在 `$DSH_HOME/quip/generations/`（文件名为该文件首条记录的本地时间），是插件自有数据，不随 fork / 导出，也不再自动清理——面板上的「打开记录文件夹」可直接在系统文件管理器里打开该目录，删除文件即删除历史；面板只查最近 500 条，目录里增删文件后再次打开面板即同步。
 
-每条记录展开后列出它在会话日志里的坐标——轮次、`seq`、虚拟步 `step`、`message.id`、所评论回复的 `seq`——并提供「复制定位命令」按钮（一条 `zstd` + `jq` 命令，按 `seq` 直接命中会话文件里那一行）。
+每条记录行显示所属文件名；展开后列出它在会话日志里的坐标——轮次、`seq`、虚拟步 `step`、`message.id`、所评论回复的 `seq`——并提供「复制定位命令」按钮（一条 `zstd` + `jq` 命令，按 `seq` 直接命中会话文件里那一行）。
 
-环境变量（可选）：`QUIP_TIMEOUT_MS` 覆盖生成超时（默认 30 秒）；`QUIP_DATA_DIR` 覆盖生成记录目录。
+环境变量（可选）：`QUIP_TIMEOUT_MS` 覆盖生成超时（默认 30 秒）；`QUIP_DATA_DIR` 覆盖记录目录的父目录（记录文件在其下的 `generations/` 子目录）。
 
 ## 工作原理
 
 - **事件驱动**：host 侧订阅 `session/event`，在 `turn/end`（`reason.kind === 'completed'`）后发起一次 `llm.stream` 调用（`purpose: 'dsh-quip/generate'`，30 秒超时）；client 渲染在 `conversation.chat.turnTail`，用 SSE 接收增量，断开时降级为 8 秒轮询。
+- **文本不做二次加工**：模型输出只去首尾空白，不剥包裹引号、不截首行——回复末尾看到的就是模型真实输出的那句；模型失败时的兜底句来自内置兜底池。两者在记录与 record 里用 `source` 区分（`model` / `fallback`）。
 - **长度只靠系统提示约束**：请求层不设 maxTokens。带思考的模型会把思考算进输出配额，硬上限曾在正文出来前把生成截断；系统提示写死「不超过 N 字、思考过程不进正文」。
 - **写入会话日志**：`appendPluginRecord(session, 'plugin:dsh-quip/quip', data)`。data 顶层为 `{v, turn, step, message, usage, request, after, plugin}`：`turn` / `step` / `message` / `usage` / `request` 与原生 `assistant/message.data` 同构，`step` 取本轮最后一步 + 1（占一个主对话永远不会走到的虚拟步，不与同轮回复同槽）；`after` 记录本轮最后一条 `assistant/message` 的日志 `seq` 与 `message.id`；`plugin` 是插件元数据（风格、文本来源 `source`、调用结局 `outcome`、路由来源、耗时）。格式版本 `v` 为 1（0.6.0 重置）；读回时 `v`、`message.content`、`after` 三者齐备才认，其余一律跳过。
 - **写入器怎么拿到**：DSH 的 `appendPluginRecord` 经 Session 的私有方法写入，V8 对私有方法的品牌检查绑定在类定义上——必须拿到宿主进程加载的那个 `dsh-session` 模块实例，npm 副本或另一 URL 的副本都会抛 `Receiver must be an instance of class Session`。插件对宿主 Session 实例调 `session.append(null)`，让它在内部抛出一个不改变日志的 TypeError，用 `Error.prepareStackTrace` 读出该方法的源文件 URL，再 `import()` 同一 URL 命中模块缓存。
@@ -101,10 +102,10 @@ Web 版与桌面版各自独立安装，profile 互不相通。本插件目前�
 | 端点 | 认证 | 用途 |
 |------|------|------|
 | `GET /api/quip/v1/health` | 匿名 | 版本、持久化诊断（写入器来源、实例比对、宿主/写入器 URL、成功/失败计数、最近错误） |
-| `GET /api/quip/v1/status` | 匿名 | 当前配置 + provider/model 目录 |
+| `GET /api/quip/v1/status` | 匿名 | 当前配置 + provider/model 目录 + 记录目录真实路径（`dataDir`） |
 | `GET /api/quip/v1/quips?session=<id>` | 需认证 | 某会话全部俏皮话（内存 miss 时从会话日志冷读） |
 | `GET /api/quip/v1/watch?session=<id>` | 需认证 | SSE 增量推送 |
-| `GET /api/quip/v1/generations` | 需认证 | 最近生成过程记录 |
+| `GET /api/quip/v1/generations?limit=` | 需认证 | 最近生成过程记录（上限 500；每次先比对记录目录，用户增删文件后自动重载） |
 | `POST /api/quip/v1/config` | 需认证 | 写回配置 |
 
 `persistence.writerLabel` 为 `host-probed`、`instanceMatch` 为 `match` 即写入器正常；刚启动尚未生成过俏皮话时两者为 `pending`，不是故障。
