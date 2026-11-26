@@ -2,8 +2,9 @@
  * dsh-quip（俏皮话）Host 半边。
  *
  * 职责：
- * 1. 订阅 `session/event`，按轮折叠素材（用户发言摘要、助手输出摘要、
- *    工具使用统计、轮次时长）——素材进模型前统一脱敏，工具结果永不进素材。
+ * 1. 订阅 `session/event`，按轮折叠素材（用户发言全文、各步回复全文、
+ *    首尾两条思考、工具计次、轮次时长）——素材按 `redact` 配置脱敏（默认开），
+ *    逐字原样不截断，工具结果永不进素材。
  * 2. `turn/end`（reason.kind 为 completed；中断类可配置）后发起一次
  *    独立的已注册模型小调用（`ctx.llm.stream`）生成一句自评。
  * 3. 生成结果写三处：内存（供端点与 SSE 读）、会话日志 plugin record
@@ -15,7 +16,8 @@
  *    - GET  /api/quip/v1/status              匿名；配置 + provider/model 目录
  *    - GET  /api/quip/v1/quips?session=<id>  当前会话的全部俏皮话（JSON）
  *    - GET  /api/quip/v1/watch?session=<id>  增量订阅（SSE）
- *    - GET  /api/quip/v1/generations         生成过程记录
+ *    - GET  /api/quip/v1/generations         生成过程记录（列表：不带大字段，改带四个字数；
+ *                                            带 `session` + `ts` 时返回该条完整记录）
  *    - POST /api/quip/v1/config              写回插件配置（configEditor）
  *
  * 持久化的硬约束（见 project-docs 方案文档「未解决的问题 ①」）：
@@ -71,9 +73,11 @@ const RECORD_TYPE = 'plugin:dsh-quip/quip'
  * - message.source.kind 说的是「谁产生了这句话」：模型生成 → model（带 provider/model）；
  *   兜底句 → 插件自有 producer kind（见 FALLBACK_SOURCE_KIND），不挂任何模型归属
  * - after = { seq, messageId, turnEndSeq }：钉回所评论的那条 assistant/message 与 turn/end
- * - plugin = { name, purpose, style, source, outcome, routeSource, durationMs }：source 标文本
- *   来源（model / fallback / no-provider），outcome 标模型调用的结局（ok / empty / timeout /
- *   aborted / error / no-provider），「调了但失败→兜底」与「没调→兜底」在日志里可分辨
+ * - plugin = { name, purpose, style, source, outcome, routeSource, durationMs, finish?, failure? }：
+ *   source 标文本来源（model / fallback / no-provider），outcome 标模型调用的结局（ok / empty /
+ *   timeout / aborted / error / no-provider），「调了但失败→兜底」与「没调→兜底」在日志里可分辨；
+ *   finish 是结束原因（finish chunk 的 reason.kind，调过模型才写），failure 是失败码精简版
+ *   { code, message, status? }（只在失败事实存在时写）。两者是 v1 之后追加的可选字段，不改版本
  */
 const RECORD_FORMAT_VERSION = 1
 /**
@@ -95,13 +99,29 @@ const FALLBACK_SOURCE_KIND = PLUGIN_TAG
 const CALL_PURPOSE = 'dsh-quip/generate'
 /** plugin record 类型语法（与 dsh-session 的 PLUGIN_RECORD_TYPE 一致）。 */
 const PLUGIN_RECORD_TYPE_RE = /^plugin:[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/
-/** 单次生成调用的默认超时（毫秒）；`QUIP_TIMEOUT_MS` 可覆盖（测试用短超时走到 timeout 路径）。 */
-const DEFAULT_GENERATION_TIMEOUT_MS = 30_000
+/** 生成超时配置项 `timeoutSeconds` 的默认值与合法范围（秒）。 */
+const DEFAULT_TIMEOUT_SECONDS = 120
+const TIMEOUT_SECONDS_MIN = 5
+const TIMEOUT_SECONDS_MAX = 600
 
-/** 读当前生效的生成超时（运行时读，便于测试与环境覆盖）。 */
-function generationTimeoutMs() {
+/** 把秒数夹进合法范围；不是有限数字时取默认值。 */
+function clampTimeoutSeconds(value) {
+  const raw = Number(value)
+  return Number.isFinite(raw)
+    ? Math.min(TIMEOUT_SECONDS_MAX, Math.max(TIMEOUT_SECONDS_MIN, Math.round(raw)))
+    : DEFAULT_TIMEOUT_SECONDS
+}
+
+/**
+ * 读当前生效的生成超时（毫秒）。环境变量 `QUIP_TIMEOUT_MS` 优先（测试用短超时走到 timeout 路径），
+ * 否则用配置项 `timeoutSeconds`。运行时读：配置是 volatile 的，GUI 改完即生效。
+ * @param {Record<string, unknown>} [conf] - 当前配置（`currentConfig` 的结果）。
+ * @returns {number}
+ */
+function generationTimeoutMs(conf) {
   const raw = Number(process.env.QUIP_TIMEOUT_MS)
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_GENERATION_TIMEOUT_MS
+  if (Number.isFinite(raw) && raw > 0) return raw
+  return clampTimeoutSeconds(conf?.timeoutSeconds) * 1000
 }
 /** SSE 心跳间隔（毫秒），低于常见代理空闲超时。 */
 const SSE_HEARTBEAT_MS = 25_000
@@ -126,6 +146,13 @@ const GEN_FILE_PREFIX = 'generations-'
 const GEN_FILE_RE = /^generations-(\d{8}-\d{6})(?:-\d+)?\.jsonl$/
 /** 本包版本（health 端点与日志用；与 package.json 同步）。 */
 const VERSION = '0.1.0'
+/**
+ * 宿主（桌面客户端）版本，记进生成记录供排查：桌面壳在构建时内联版本号，并把它放进
+ * Host 进程的环境变量 `DSH_CLIENT_VERSION`。源码启动 / 测试进程没有这个变量，记 null。
+ */
+const HOST_VERSION = typeof process.env.DSH_CLIENT_VERSION === 'string' && process.env.DSH_CLIENT_VERSION !== ''
+  ? process.env.DSH_CLIENT_VERSION
+  : null
 
 // ---- 生成过程记录文件（纯函数，不依赖 ctx） ----
 
@@ -153,6 +180,8 @@ function parseGenerationLine(line, fileName) {
   }
   delete record.raw
   delete record.cleaned
+  // 死字段：请求层取消硬上限后 maxTokens 恒为 null，新记录不再写；旧记录加载时丢弃（磁盘文件不重写）
+  delete record.maxTokens
   if (typeof record.file !== 'string' || record.file === '') record.file = fileName
   return record
 }
@@ -222,6 +251,30 @@ function migrateLegacyGenerationFile() {
   for (let n = 2; existsSync(target); n++) target = join(GEN_DIR, `${GEN_FILE_PREFIX}${stamp}-${n}.jsonl`)
   renameSync(LEGACY_GEN_FILE, target)
   return true
+}
+
+/**
+ * 列表接口每条记录不带的大字段：点开某条时按 `session + ts` 另取全文。
+ * 响应形状仍是每条一个普通对象，只是改带四个字数，面板据此提示「有全文可看」。
+ */
+const GENERATION_LARGE_FIELDS = ['material', 'systemPrompt', 'rawText', 'reasoningText', 'replayState']
+
+/**
+ * 一条生成记录的列表形态：去掉大字段，改带四个字数。
+ * 记录不截断后一条长轮次约 60 KB，20 条的列表响应一次可达 1 MB，而面板每次展开都会拉——
+ * 内存里仍是完整记录，只在出接口时裁剪。
+ * @param {Record<string, unknown>} record - 完整生成记录（不被修改）。
+ * @returns {Record<string, unknown>}
+ */
+function slimGeneration(record) {
+  const slim = { ...record }
+  for (const field of GENERATION_LARGE_FIELDS) delete slim[field]
+  const chars = (text) => (typeof text === 'string' ? text.length : 0)
+  slim.materialChars = chars(record.material)
+  slim.systemPromptChars = chars(record.systemPrompt)
+  slim.rawTextChars = chars(record.rawText)
+  slim.reasoningTextChars = chars(record.reasoningText)
+  return slim
 }
 
 // ---- 会话日志 plugin record ----
@@ -416,10 +469,15 @@ export const Config = Schema === null ? undefined : Schema.object({
     .description('一句话的字数上限（写进系统提示；请求层不设 maxTokens，显示也永不截断）'),
   temperature: Schema.number().default(1.2).volatile().step(0.1).min(0).max(2)
     .description('生成温度（越高越发散）'),
+  timeoutSeconds: Schema.number().default(DEFAULT_TIMEOUT_SECONDS).volatile()
+    .min(TIMEOUT_SECONDS_MIN).max(TIMEOUT_SECONDS_MAX).step(5)
+    .description('生成超时（秒）：超过后按超时处理并走兜底，范围 5–600'),
   includeInterrupted: Schema.boolean().default(false).volatile()
     .description('被中断的轮次也尝试生成（素材为已输出的部分）'),
   includeReasoning: Schema.boolean().default(true).volatile()
-    .description('素材带上模型的思考过程（脱敏后截断）：自评能引用它内心的犹豫与绕路，更贴切；关闭可省输入 token'),
+    .description('素材带上本轮第一个和最近一个思考（全文）；关闭可省输入 token'),
+  redact: Schema.boolean().default(true).volatile()
+    .description('素材脱敏：把疑似密钥 / token / 密码替换为 [redacted] 后再发给模型；关闭后密钥会原样进模型，也会明文写进生成记录'),
   fallback: Schema.boolean().default(true).volatile()
     .description('模型调用失败时改用内置兜底池（按风格）'),
   historyPerSession: Schema.number().default(32).volatile().min(4).max(512)
@@ -463,8 +521,11 @@ function currentConfig(config) {
     reasoningEffort: readConfig(config, 'reasoningEffort', 'auto'),
     maxChars: readConfig(config, 'maxChars', 64),
     temperature: readConfig(config, 'temperature', 1.2),
+    timeoutSeconds: clampTimeoutSeconds(readConfig(config, 'timeoutSeconds', DEFAULT_TIMEOUT_SECONDS)),
     includeInterrupted: readConfig(config, 'includeInterrupted', false),
     includeReasoning: readConfig(config, 'includeReasoning', true),
+    // 只有显式 false 才关脱敏：缺省、null、无法识别的值都按「开」处理，宁可多脱
+    redact: readConfig(config, 'redact', true) !== false,
     fallback: readConfig(config, 'fallback', true),
     historyPerSession: readConfig(config, 'historyPerSession', 32),
   }
@@ -549,24 +610,134 @@ function readJsonBody(req) {
 }
 
 /**
- * 消费一次 llm.stream 调用，拼接全部文本并保留 usage。
- * 契约见 dsh-llm `StreamChunk`：text-delta 增量、usage 计量、finish 终态。
+ * 原样记录的字段（`failure`、`replayState`、`usage`）的安全快照：可 JSON 序列化的
+ * 转成脱离原对象的普通值，序列化失败记 `"[unserializable]"`——只丢这一个字段，
+ * 不让整条生成记录或会话日志 record 落不了盘。
+ * @template T
+ * @param {T} value - 任意值。
+ * @returns {T | string | null}
+ */
+function snapshotJsonValue(value) {
+  if (value === null || value === undefined) return value ?? null
+  try {
+    const text = JSON.stringify(value)
+    return text === undefined ? null : JSON.parse(text)
+  } catch {
+    return '[unserializable]'
+  }
+}
+
+/**
+ * 从 finish 的 `reason` 取失败事实：`reason.failure` 原样；没有则 null。
+ * @param {unknown} reason - finish chunk 的 `reason`（对象 `{kind, failure?}`）。
+ * @returns {Record<string, unknown> | null}
+ */
+function failureOfReason(reason) {
+  if (reason === null || typeof reason !== 'object') return null
+  const failure = /** @type {any} */ (reason).failure
+  return failure !== null && failure !== undefined && typeof failure === 'object'
+    ? /** @type {any} */ (failure)
+    : null
+}
+
+/**
+ * 从一个抛出的值取失败事实：宿主的 `LlmError` 自带 `failure`（`{code, message, …}`），
+ * 直接用；其余异常折成 `{code: <error.name>, message: <error.message>}`。
+ * @param {unknown} error - 抛出的值。
+ * @returns {{ code: string, message: string }}
+ */
+function failureOfError(error) {
+  const source = error !== null && typeof error === 'object' ? /** @type {any} */ (error) : null
+  const own = source?.failure
+  if (own !== null && own !== undefined && typeof own === 'object'
+    && typeof own.code === 'string' && typeof own.message === 'string') {
+    return own
+  }
+  if (error instanceof Error) return { code: error.name, message: error.message }
+  const message = source?.message
+  if (typeof message === 'string') {
+    const code = source.code
+    return { code: typeof code === 'string' && code !== '' ? code : 'UNKNOWN', message }
+  }
+  return { code: typeof error, message: String(error) }
+}
+
+/**
+ * 失败事实的可读文本：`code: message`；没有失败事实时为空串。
+ * @param {unknown} failure - 失败事实（`{code, message, …}`）。
+ * @returns {string}
+ */
+function describeFailure(failure) {
+  if (failure === null || typeof failure !== 'object') return ''
+  const { code, message } = /** @type {any} */ (failure)
+  const codeText = typeof code === 'string' ? code : ''
+  const messageText = typeof message === 'string' ? message : ''
+  if (codeText === '' && messageText === '') return ''
+  if (codeText === '') return messageText
+  return messageText === '' ? codeText : `${codeText}: ${messageText}`
+}
+
+/** `前缀（code: message）`；没有失败事实时只有前缀。 */
+function withFailure(prefix, failure) {
+  const detail = describeFailure(failure)
+  return detail === '' ? prefix : `${prefix} (${detail})`
+}
+
+/**
+ * 会话日志 record 里的失败码精简版：`{code, message, status?}`。
+ * record 是一条汇总记录，失败事实的其余字段（requestId 等）只进生成记录。
+ * @param {unknown} failure - 失败事实。
+ * @returns {{ code: string, message: string, status?: number }}
+ */
+function failureSummaryOf(failure) {
+  const full = failureOfError(failure)
+  const status = failure !== null && typeof failure === 'object' ? /** @type {any} */ (failure).status : undefined
+  return Number.isFinite(status)
+    ? { code: full.code, message: full.message, status }
+    : { code: full.code, message: full.message }
+}
+
+/**
+ * 消费一次 llm.stream 调用，收集模型这次调用的全部输出与终态。
+ * 契约见 dsh-llm `StreamChunk`（`src/types.ts`）：
+ * - `text-delta` / `reasoning-delta`：正文与思考的增量，字段都是 `text`；
+ * - `usage`：用量；适配器保证它先于 finish、之后不再有 chunk；
+ * - `finish`：终态。`reason` 是**对象** `{kind, failure?}`，`kind` ∈ stop / tool-calls /
+ *   max-tokens / aborted / error；aborted 与 error 必带 `failure`（`{code, message, status?}`）。
+ *   适配器抛出的异常由宿主 LlmRuntime 规范化成 error / aborted 的 finish，而不是顶层
+ *   `chunk.error`，也不是字符串 `reason`——插件声明支持的宿主范围内从不存在字符串协议。
+ *
+ * 结束形态必须原样带出去，结局由调用方判定：把 `error` / `aborted` 当成正常结束，
+ * 半句话就会被展示并永久写进只追加的会话日志。
  *
  * signal 中止必须能**打破等待**：只在收到下一个 chunk 后检查 `signal.aborted`
  * 是不够的——模型流在超时后可能永远不再产出，`for await` 会无限挂起，超时
  * 形同虚设。这里把 `iterator.next()` 与 abort 事件 race，中止时立即退出并标记
- * `aborted`，让调用方能区分「超时」与「模型异常」。
- * 终止原因必须完整保留：`finish.reason` 为 `error` 时流可能不抛异常，只把失败写在
- * chunk 上；额度耗尽、鉴权失败这类错误也常以「正常结束但零输出」的形态出现。
- * 只按 `aborted` 判失败会让这些真实失败被当成成功并静默降级到兜底池。
- * @returns {Promise<{ text: string, usage: Record<string, number> | null, aborted: boolean, finishReason: string | null, error: unknown }>}
+ * `abortedBySignal`；此时 finish 与之后的 usage 都拿不到，照实记 null。
+ *
+ * 本函数不抛出：迭代本身抛出时，已收到的文本、用量与耗时照常返回，异常放在 `thrown`。
+ * @param {AsyncIterable<Record<string, unknown>>} stream - `ctx.llm.stream` 返回的 chunk 流。
+ * @param {AbortSignal | undefined} signal - 插件自己的超时信号。
+ * @returns {Promise<{
+ *   rawText: string, reasoningText: string, usage: Record<string, number> | null,
+ *   finishKind: string | null, failure: Record<string, unknown> | null, replayState: unknown,
+ *   abortedBySignal: boolean, thrown: unknown, chunks: number,
+ *   timing: { firstChunkMs: number | null, firstTextMs: number | null, streamMs: number },
+ * }>}
  */
 async function collectStreamResult(stream, signal) {
-  let text = ''
+  const startedAt = Date.now()
+  let rawText = ''
+  let reasoningText = ''
   let usage = null
-  let aborted = false
-  let finishReason = null
-  let finishError = null
+  let finishKind = null
+  let failure = null
+  let replayState = null
+  let abortedBySignal = false
+  let thrown = null
+  let chunks = 0
+  let firstChunkMs = null
+  let firstTextMs = null
   const iterator = stream[Symbol.asyncIterator]()
   let onAbort = null
   const abortRace = new Promise((resolve) => {
@@ -579,36 +750,45 @@ async function collectStreamResult(stream, signal) {
     for (;;) {
       const next = await Promise.race([iterator.next(), abortRace])
       if (next === undefined || typeof next !== 'object') break
-      if (next.aborted === true) { aborted = true; break }
+      if (next.aborted === true) { abortedBySignal = true; break }
       if (next.done) break
       const chunk = next.value
       if (!chunk || typeof chunk !== 'object') continue
-    if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-      text += chunk.text
-      continue
-    }
-    if (chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object') {
-      const u = chunk.usage
-      usage = {
-        inputTokens: Number(u.inputTokens) || 0,
-        outputTokens: Number(u.outputTokens) || 0,
-        ...(Number.isFinite(u.totalTokens) ? { totalTokens: Number(u.totalTokens) } : {}),
-        ...(Number.isFinite(u.cacheReadTokens) ? { cacheReadTokens: Number(u.cacheReadTokens) } : {}),
-        ...(Number.isFinite(u.cacheWriteTokens) ? { cacheWriteTokens: Number(u.cacheWriteTokens) } : {}),
-        ...(Number.isFinite(u.reasoningTokens) ? { reasoningTokens: Number(u.reasoningTokens) } : {}),
+      chunks += 1
+      if (firstChunkMs === null) firstChunkMs = Date.now() - startedAt
+      if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+        if (firstTextMs === null) firstTextMs = Date.now() - startedAt
+        rawText += chunk.text
+        continue
       }
-      continue
-    }
+      if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+        reasoningText += chunk.text
+        continue
+      }
+      // 用量原样留引用（最后一个 usage chunk），调用方写记录时做安全快照。不再逐字段挑选：
+      // provider 多报的字段同样是这次调用的真实用量，要记全
+      if (chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object') {
+        usage = chunk.usage
+        continue
+      }
       if (chunk.type === 'finish') {
-        const reason = typeof chunk.reason === 'string' ? chunk.reason : null
-        finishReason = reason
-        if (reason === 'aborted' || reason === 'error') aborted = reason === 'aborted'
-        // DSH 的 finish chunk 可能带 error（adapter 把失败规范化到这里）
-        if (chunk.error !== undefined && chunk.error !== null) finishError = chunk.error
-        if (reason === 'error' && finishError === null) finishError = new Error(`model stream finished with reason "error"`)
+        const reason = chunk.reason
+        if (reason !== null && typeof reason === 'object' && typeof /** @type {any} */ (reason).kind === 'string') {
+          finishKind = /** @type {any} */ (reason).kind
+          failure = failureOfReason(reason)
+        } else if (typeof reason === 'string') {
+          // 防御：声明支持的宿主范围内没有字符串协议，只为不让旧形状静默变成「没有 finish」
+          finishKind = reason
+          failure = failureOfError(chunk.error ?? new Error(`model stream finished with reason "${reason}"`))
+        }
+        if (chunk.replayState !== undefined && chunk.replayState !== null) replayState = chunk.replayState
         break
       }
     }
+  } catch (error) {
+    // 迭代本身抛出（宿主已把适配器异常规范化成 finish，这里只是防御）：已收到的内容照记
+    thrown = error
+    failure = failureOfError(error)
   } finally {
     if (onAbort !== null && signal !== undefined && signal !== null) signal.removeEventListener('abort', onAbort)
     // 让生成器执行自己的清理（关闭底层请求等）。不 await：对一个正挂在 await 上的
@@ -618,7 +798,18 @@ async function collectStreamResult(stream, signal) {
       if (returned !== undefined && typeof returned.catch === 'function') returned.catch(() => {})
     } catch { /* 迭代器已关闭 */ }
   }
-  return { text, usage, aborted, finishReason, error: finishError }
+  return {
+    rawText,
+    reasoningText,
+    usage,
+    finishKind,
+    failure,
+    replayState,
+    abortedBySignal,
+    thrown,
+    chunks,
+    timing: { firstChunkMs, firstTextMs, streamMs: Date.now() - startedAt },
+  }
 }
 
 /** 错误对象的可读文本（带栈的前三帧，便于在 health 里看到真实失败位置）。 */
@@ -772,25 +963,32 @@ export function apply(ctx, config) {
    * 失败不抛：计数 + 记录 + warn，俏皮话本身已进内存与 SSE。
    * @param {object} session - 宿主 Session 实例。
    * @param {Record<string, unknown>} record - 要写进会话日志的 record data。
+   * @param {{ persistMs?: number | null }} [timing] - 传入时把这次写入自身的耗时写进 `persistMs`（生成记录的耗时明细）。
    * @returns {Promise<number | null>} record 在会话日志里的 seq（定位到那一行的坐标）；写入器缺失或失败为 null。
    */
-  async function persistQuip(session, record) {
-    const writer = await ensureWriter(session)
-    if (writer.append === null) {
-      persistence.failed += 1
-      persistence.lastError = { name: 'NO_WRITER', message: 'no dsh-session module available', stack: null }
-      return null
-    }
+  async function persistQuip(session, record, timing = null) {
+    const writeStartedAt = Date.now()
     try {
-      const seq = writer.append(session, RECORD_TYPE, record)
-      persistence.appended += 1
-      return typeof seq === 'number' ? seq : null
-    } catch (error) {
-      persistence.failed += 1
-      persistence.lastError = describeError(error)
-      ctx.logger.warn(`${PLUGIN_TAG}: plugin record append failed (%s: %s) — quip kept in memory only: %s`,
-        persistence.lastError.name, persistence.lastError.message, persistence.lastError.stack ?? '')
-      return null
+      const writer = await ensureWriter(session)
+      if (writer.append === null) {
+        persistence.failed += 1
+        persistence.lastError = { name: 'NO_WRITER', message: 'no dsh-session module available', stack: null }
+        return null
+      }
+      try {
+        const seq = writer.append(session, RECORD_TYPE, record)
+        persistence.appended += 1
+        return typeof seq === 'number' ? seq : null
+      } catch (error) {
+        persistence.failed += 1
+        persistence.lastError = describeError(error)
+        ctx.logger.warn(`${PLUGIN_TAG}: plugin record append failed (%s: %s) — quip kept in memory only: %s`,
+          persistence.lastError.name, persistence.lastError.message, persistence.lastError.stack ?? '')
+        return null
+      }
+    } finally {
+      // 成功、失败、写入器缺失都算「写过」；没调用它（没写会话日志）才是 null
+      if (timing !== null) timing.persistMs = Date.now() - writeStartedAt
     }
   }
 
@@ -803,9 +1001,10 @@ export function apply(ctx, config) {
    * 两种来源下都有值可读。
    * @param {object} session - 宿主 Session 实例。
    * @param {Record<string, unknown>} record - 要写进会话日志的 record data。
+   * @param {{ persistMs?: number | null }} [timing] - 生成记录的耗时明细；写入会话日志的耗时记进 `persistMs`。
    * @returns {Promise<number | null>} 写入完成后的 record seq（见 {@link persistQuip}）。
    */
-  function pushQuip(session, record) {
+  function pushQuip(session, record, timing = null) {
     const sessionId = session.id
     // 运行时 entry = record + client 渲染所需的派生字段（text/source 方便直接读，
     // 不必让 client 了解原生 message.content 的嵌套）
@@ -825,7 +1024,7 @@ export function apply(ctx, config) {
     while (list.length > limit) list.shift()
     broadcast(sessionId, entry)
     // 调用方 await 它拿到 seq 写进生成记录；内存与 SSE 已推送，不依赖写入成败
-    const persisted = persistQuip(session, record)
+    const persisted = persistQuip(session, record, timing)
     ctx.logger.debug(`${PLUGIN_TAG}: session %s turn %s quip "%s"`, sessionId, record.turn, record.text)
     return persisted
   }
@@ -885,13 +1084,14 @@ export function apply(ctx, config) {
   const modelMetaCache = new Map()
 
   /**
-   * 取一个精确模型的思考等级元数据（`reasoning.efforts`）。
+   * 取一个精确模型的元数据（`resolveModelInfo` 的结果里本插件用得上的部分）。
    *
    * **必须用 `resolveModelInfo`，不能用 `resolveModel`**：后者在 LlmRuntime 上是基类
    * 占位实现，永远返回不带 `reasoning` 的 `{provider, id, name}`；只有
    * `resolveModelInfo` 会经 `registration(provider).adapter.resolveModel` 走到真正的
    * adapter，拿到声明过的思考等级。DSH 自己的模型选择器用的也是前者。
    * 没有 model id（provider 默认模型）、宿主无此方法或查询失败时返回 null。
+   * @returns {Promise<{ efforts: Array<{ id: string, name: string }>, defaultEffort: string | undefined, contextWindow?: number, defaultMaxTokens?: number } | null>}
    */
   function modelMetaOf(provider, model) {
     const key = `${provider}/${model}`
@@ -904,13 +1104,18 @@ export function apply(ctx, config) {
         if (resolve === null) return null
         try {
           const info = await resolve(provider, model)
-          const reasoning = info?.reasoning
-          if (reasoning === undefined || !Array.isArray(reasoning.efforts)) return { efforts: [], defaultEffort: undefined }
+          const reasoning = Array.isArray(info?.reasoning?.efforts) ? info.reasoning : null
+          const contextWindow = info?.context?.contextWindow
           return {
-            efforts: reasoning.efforts
-              .filter((effort) => effort !== null && typeof effort === 'object' && typeof effort.id === 'string')
-              .map((effort) => ({ id: effort.id, name: typeof effort.name === 'string' ? effort.name : effort.id })),
-            defaultEffort: typeof reasoning.defaultEffort === 'string' ? reasoning.defaultEffort : undefined,
+            efforts: reasoning === null
+              ? []
+              : reasoning.efforts
+                .filter((effort) => effort !== null && typeof effort === 'object' && typeof effort.id === 'string')
+                .map((effort) => ({ id: effort.id, name: typeof effort.name === 'string' ? effort.name : effort.id })),
+            defaultEffort: typeof reasoning?.defaultEffort === 'string' ? reasoning.defaultEffort : undefined,
+            // provider 公布的模型窗口、不传上限时适配器代用的输出上限；未公布时省略这两个键
+            ...(Number.isFinite(contextWindow) ? { contextWindow } : {}),
+            ...(Number.isFinite(info?.defaultMaxTokens) ? { defaultMaxTokens: info.defaultMaxTokens } : {}),
           }
         } catch {
           return null
@@ -947,12 +1152,12 @@ export function apply(ctx, config) {
     const token = `${sessionId}:${material.turn}`
     if (generating.has(token)) return
     generating.add(token)
-    const controller = new AbortController()
-    let timedOut = false
-    const timeoutMs = generationTimeoutMs()
-    const timer = setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
     const startedAt = Date.now()
     const conf = currentConfig(config)
+    const timeoutMs = generationTimeoutMs(conf)
+    const controller = new AbortController()
+    let timedOut = false
+    const timer = setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
     // 跟随会话：会话当前选中的模型就是用户眼前看到的模型，用它生成口径一致；
     // 会话还没记录过选择时才回落到配置的 provider/model。
     const sessionSelection = conf.followSessionModel ? sessionModels.get(sessionId) : undefined
@@ -963,11 +1168,21 @@ export function apply(ctx, config) {
     const reasoningEffort = sessionSelection?.reasoningEffort !== undefined
       ? sessionSelection.reasoningEffort
       : await resolveReasoningEffort(route, conf.reasoningEffort)
+    /** 解析 auto 之前的等级：配置值，或跟随会话时会话选的等级（未指定则 null）。 */
+    const configuredReasoningEffort = sessionSelection !== undefined
+      ? (sessionSelection.reasoningEffort ?? null)
+      : conf.reasoningEffort
+    // 该模型公布的等级、窗口与默认输出上限（resolveReasoningEffort 已查过同一份，这里走缓存）
+    const modelMeta = route !== null && typeof route.model === 'string' && route.model !== ''
+      ? await modelMetaOf(route.provider, route.model)
+      : null
+    /** 路由与思考等级解析完成的时刻（相对发起时刻）：之后的耗时都算模型的。 */
+    const routeMs = Date.now() - startedAt
     const systemPrompt = buildSystemPrompt(conf.style, conf.customPrompt, { maxChars: conf.maxChars })
     const materialText = renderMaterial(material, { includeReasoning: conf.includeReasoning })
     /** 会话日志写入的 promise：拿到 seq 后回填 trace.recordSeq，再落生成记录。 */
     let persisted = null
-    /** 生成过程记录（成功与失败都记；恢复查看器用）。 */
+    /** 生成过程记录（成功与失败都记；恢复查看器用）。不设字数限制：要大要全。 */
     const trace = {
       ts: startedAt,
       session: sessionId,
@@ -985,14 +1200,20 @@ export function apply(ctx, config) {
       provider: route?.provider ?? null,
       model: route?.model ?? null,
       reasoningEffort: reasoningEffort ?? null,
+      configuredReasoningEffort,
+      /** 该模型公布的思考等级（从低到高）与 provider 默认等级；查不到为 null。 */
+      effortsOffered: modelMeta?.efforts.map((effort) => effort.id) ?? null,
+      providerDefaultEffort: modelMeta?.defaultEffort ?? null,
+      // provider 公布的模型窗口、不传上限时适配器代用的输出上限；未公布则省略这两个键
+      ...(modelMeta?.contextWindow === undefined ? {} : { modelContextWindow: modelMeta.contextWindow }),
+      ...(modelMeta?.defaultMaxTokens === undefined ? {} : { modelDefaultMaxTokens: modelMeta.defaultMaxTokens }),
       temperature: conf.temperature,
-      // 请求层不设输出上限（见 buildSystemPrompt 的说明）；null 表示「未限制」
-      maxTokens: null,
       // 辅助调用分类
       purpose: CALL_PURPOSE,
       /** 路由来源：session（跟随会话选择）/ config（回落到固定配置）。 */
       routeSource: sessionSelection !== undefined ? 'session' : 'config',
-      material: materialText.slice(0, 2000),
+      // 发给模型的用户消息全文（不截断）
+      material: materialText,
       systemPrompt,
       /**
        * 用户最终看到的那句话，与写进会话日志的 message.content[0].text 完全相同：
@@ -1000,13 +1221,56 @@ export function apply(ctx, config) {
        * 谁产生的看 source；模型失败且未开兜底时为空串，原因看 error。
        */
       text: '',
+      /** 俏皮话输出原文（trim 之前）：失败时它就是「收到但未展示」的那段文本。 */
+      rawText: '',
+      /** 俏皮话模型写这句话时自己的思考全文；provider 不转发思考增量则为空串。 */
+      reasoningText: '',
       /** 所属记录文件名（recordGeneration 写入前填上；面板据此告诉用户去哪删）。 */
       file: null,
       /** 模型调用的结局：ok / timeout / aborted / error / skip / no-provider。 */
       outcome: 'error',
       /** 最终文本的来源：model / fallback / no-provider / skip。 */
       source: 'error',
+      /** 这次调用的用量，provider 报什么记什么（含 reasoningTokens 等可选字段）；没调通为 null。 */
       usage: null,
+      /**
+       * 结束原因（finish chunk 的 `reason.kind`：stop / tool-calls / max-tokens / aborted / error）。
+       * 流没有 finish 就结束、或被插件自己的超时信号先打断时为 null——与 `outcome` 分开记，
+       * 「撞上限后被展示的半句」和「正常停」在记录里可区分。
+       */
+      finishKind: null,
+      /** 失败事实原样（`{code, message, status?, …}`）：aborted / error 的 finish 必带；其余为 null。 */
+      failure: null,
+      /** finish 上的 provider 回放元数据（响应 id、原生结束原因等），原样；没有则 null。 */
+      replayState: null,
+      /**
+       * 耗时明细（毫秒）。除 rebuildMs / persistMs 是各自操作自身的耗时外，都相对发起时刻 ts：
+       * routeMs 路由解析完成、firstChunkMs 首个 chunk、firstTextMs 首个正文增量、streamMs 流结束。
+       * 没有发生的时刻为 null。
+       */
+      timing: {
+        routeMs,
+        /** 补折素材时读会话日志的耗时；非补折路径的素材没有这个属性，记 null。 */
+        rebuildMs: Number.isFinite(material.rebuildMs) ? material.rebuildMs : null,
+        firstChunkMs: null,
+        firstTextMs: null,
+        streamMs: null,
+        persistMs: null,
+      },
+      /** 收到的 chunk 总数。 */
+      chunks: 0,
+      /** 是否插件自己的超时信号打断了流；timeoutMs 是本次生效的阈值。 */
+      timedOut: false,
+      timeoutMs,
+      /** 本轮 turn/end 的 reason.kind（completed / aborted / interrupted / error …）。 */
+      turnReason: material.endedReason === '' ? null : material.endedReason,
+      // 影响生成、素材与兜底的配置快照
+      maxChars: conf.maxChars,
+      includeReasoning: conf.includeReasoning,
+      fallbackEnabled: conf.fallback,
+      redacted: conf.redact,
+      pluginVersion: VERSION,
+      hostVersion: HOST_VERSION,
       durationMs: 0,
       error: null,
     }
@@ -1015,6 +1279,7 @@ export function apply(ctx, config) {
       let source = 'fallback'
       if (route !== null) {
         try {
+          const streamStartedAt = Date.now()
           const result = await collectStreamResult(ctx.llm.stream({
             provider: route.provider,
             model: route.model,
@@ -1031,21 +1296,48 @@ export function apply(ctx, config) {
             signal: controller.signal,
             sessionId,
           }), controller.signal)
-          trace.usage = result.usage
-          // 流以 error 结束（或带着 error chunk）时，即使没抛异常也必须记失败
-          if (result.error !== null && result.error !== undefined) throw result.error
+          // 流内的耗时相对流发起时刻；换算成相对 trace.ts（发起时刻），各项才能直接对照
+          const streamOffsetMs = streamStartedAt - startedAt
+          const relative = (ms) => (ms === null ? null : streamOffsetMs + ms)
+          trace.usage = snapshotJsonValue(result.usage)
+          trace.rawText = result.rawText
+          trace.reasoningText = result.reasoningText
+          trace.chunks = result.chunks
+          trace.timing.firstChunkMs = relative(result.timing.firstChunkMs)
+          trace.timing.firstTextMs = relative(result.timing.firstTextMs)
+          trace.timing.streamMs = relative(result.timing.streamMs)
+          trace.finishKind = result.finishKind
+          trace.failure = snapshotJsonValue(result.failure)
+          trace.replayState = snapshotJsonValue(result.replayState)
           // 模型原文只去首尾空白：用户要求看到的就是模型真实输出的内容，不再剥引号、不再截首行
-          const modelText = typeof result.text === 'string' ? result.text.trim() : ''
-          if (result.aborted) {
-            trace.outcome = timedOut ? 'timeout' : 'aborted'
-            trace.error = timedOut ? `generation exceeded ${timeoutMs} ms` : 'generation aborted'
-          } else if (result.text.includes(SKIP_SENTINEL)) {
+          const modelText = result.rawText.trim()
+          if (result.abortedBySignal) {
+            // 插件自己的超时信号先打断：finish 与之后的 usage 都拿不到，照实记 null
+            trace.outcome = 'timeout'
+            trace.error = `generation exceeded ${timeoutMs} ms`
+          } else if (result.finishKind === 'aborted') {
+            // 宿主侧中止（不是插件超时）：已收到的部分输出不展示
+            trace.outcome = 'aborted'
+            trace.error = withFailure('generation aborted', result.failure)
+          } else if (result.finishKind === 'error' || result.thrown !== null) {
+            // 失败先于 skip 哨兵与文本：error 时即使已有半句、甚至文本里带哨兵，也记失败、不展示。
+            // 曾把这种流当成正常结束，半句俏皮话被展示并永久写进只追加的会话日志。
+            trace.outcome = 'error'
+            trace.error = result.thrown === null
+              ? (describeFailure(result.failure) || 'model stream finished with reason "error"')
+              : describeError(result.thrown).message
+            // 失败必须在默认日志级别可见：额度耗尽/鉴权失败时用户需要知道为什么只剩兜底句
+            ctx.logger.warn(`${PLUGIN_TAG}: generation failed (%s): %s`,
+              result.failure?.code ?? describeError(result.thrown).name, trace.error)
+          } else if (modelText.includes(SKIP_SENTINEL)) {
             // 模型自己判定素材不足：尊重它，不用兜底池；哨兵原文留在 text 里供面板查看。
             trace.outcome = 'skip'
             trace.source = 'skip'
             trace.text = modelText
             return
           } else if (modelText !== '') {
+            // 正常停 / tool-calls / max-tokens / 流没有 finish 就结束（宿主自己的组装器也按 stop 对待）：
+            // 有文本就是 ok，原样展示。max-tokens 实际碰不到——请求不传上限，尾注约 30 token。
             text = modelText
             source = 'model'
             trace.outcome = 'ok'
@@ -1053,14 +1345,15 @@ export function apply(ctx, config) {
             // 流正常结束但没有任何可用文本：额度耗尽、鉴权失败、被上游内容策略
             // 拦截等都会长这样。曾把它记成 ok，导致真实失败在生成记录里完全不可见。
             trace.outcome = 'empty'
-            trace.error = `model returned no text (finish=${result.finishReason ?? 'none'}, usage=${result.usage === null ? 'none' : JSON.stringify(result.usage)})`
+            trace.error = `model returned no text (finish=${result.finishKind ?? 'none'}, usage=${result.usage === null ? 'none' : JSON.stringify(result.usage)})`
             ctx.logger.warn(`${PLUGIN_TAG}: %s/%s returned no text (finish=%s)`,
-              route.provider, route.model ?? '(default)', result.finishReason ?? 'none')
+              route.provider, route.model ?? '(default)', result.finishKind ?? 'none')
           }
         } catch (error) {
+          // 连流都没建立（`ctx.llm.stream` 同步抛出等）：一个 chunk 都没有，失败事实取自异常
+          trace.failure = snapshotJsonValue(failureOfError(error))
           trace.outcome = 'error'
           trace.error = describeError(error).message
-          // 失败必须在默认日志级别可见：额度耗尽/鉴权失败时用户需要知道为什么只剩兜底句
           ctx.logger.warn(`${PLUGIN_TAG}: generation failed (%s): %s`, describeError(error).name, trace.error)
         }
       } else {
@@ -1137,11 +1430,17 @@ export function apply(ctx, config) {
             outcome: trace.outcome,
             routeSource: trace.routeSource,
             durationMs,
+            // 结束原因与失败码（可选字段，record 格式版本不动）：调过模型才写 finish——
+            // null 表示没拿到 finish（插件超时先打断 / 流没有 finish 就结束）；
+            // failure 只在失败事实存在时写
+            ...(route === null ? {} : { finish: trace.finishKind }),
+            ...(trace.failure === null ? {} : { failure: failureSummaryOf(trace.failure) }),
           },
-        })
+        }, trace.timing)
       }
     } finally {
       if (trace.durationMs === 0) trace.durationMs = Date.now() - startedAt
+      trace.timedOut = timedOut
       // 等 record 真正落进会话日志、拿到 seq 再记生成过程：面板靠 recordSeq 定位到会话文件的那一行。
       // persistQuip 自己吞错并返回 null，这里的 await 只会等到「成功 seq」或「null」。
       if (persisted !== null) trace.recordSeq = await persisted
@@ -1223,7 +1522,8 @@ export function apply(ctx, config) {
       return
     }
     const material = folding.get(sessionId)
-    if (material !== undefined) foldEvent(material, event)
+    // 脱敏开关在折叠时读取，对之后折叠的事件生效
+    if (material !== undefined) foldEvent(material, event, { redact: currentConfig(config).redact })
   })
 
   /**
@@ -1234,7 +1534,7 @@ export function apply(ctx, config) {
    */
   function finishTurn(session, material, event) {
     // 结束原因与 turn/end 的 seq（record.after 的直接前驱锚点）都由 foldEvent 记
-    foldEvent(material, event)
+    foldEvent(material, event, { redact: currentConfig(config).redact })
     const reason = event.data?.reason?.kind ?? 'completed'
     const conf = currentConfig(config)
     if (!conf.enabled) return
@@ -1255,6 +1555,7 @@ export function apply(ctx, config) {
     if (!Number.isInteger(turn)) return null
     const sessionQuery = ctx.get('sessionQuery')
     if (sessionQuery === undefined || typeof sessionQuery.readSession !== 'function') return null
+    const rebuildStartedAt = Date.now()
     try {
       const snapshot = await sessionQuery.readSession(session.id)
       const events = Array.isArray(snapshot?.events) ? snapshot.events : []
@@ -1264,7 +1565,9 @@ export function apply(ctx, config) {
       }
       if (start < 0) return null
       const material = freshTurnMaterial()
-      for (let i = start; i < events.length; i++) foldEvent(material, events[i])
+      for (let i = start; i < events.length; i++) foldEvent(material, events[i], { redact: currentConfig(config).redact })
+      // 读会话日志的耗时挂在素材上，带进生成记录的 timing.rebuildMs（实时折叠的素材没有这个属性）
+      material.rebuildMs = Date.now() - rebuildStartedAt
       ctx.logger.info(`${PLUGIN_TAG}: material for turn ${turn} rebuilt from session log (${events.length - start} events)`)
       return material
     } catch (error) {
@@ -1295,15 +1598,23 @@ export function apply(ctx, config) {
   // ---- HTTP 端点 ----
   const webServer = ctx.get('webServer')
   if (webServer !== undefined) {
-    /** 从查询串取 session 参数。 */
-    const sessionParam = (req) => {
+    /** 请求的查询参数（URL 畸形时为空）。 */
+    const queryOf = (req) => {
       try {
-        const value = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('session')
-        return typeof value === 'string' && value !== '' ? value : null
+        return new URL(req.url ?? '/', 'http://127.0.0.1').searchParams
       } catch {
-        return null
+        return new URLSearchParams()
       }
     }
+
+    /** 从查询串取一个非空字符串参数；没有则为 null。 */
+    const paramOf = (req, name) => {
+      const value = queryOf(req).get(name)
+      return typeof value === 'string' && value !== '' ? value : null
+    }
+
+    /** 从查询串取 session 参数。 */
+    const sessionParam = (req) => paramOf(req, 'session')
 
     // 路由注册必须挂 ctx.effect：entry 重载（dispose 旧 ctx）时先撤销旧路由，
     // 新实例重新注册；否则 webServer 报 duplicate exact route 且新实例激活失败。
@@ -1358,15 +1669,20 @@ export function apply(ctx, config) {
         // 用户可能刚在文件管理器里删了记录文件：目录一变就重载，面板不必等重启
         reconcileGenerations()
         const sessionId = sessionParam(req)
+        // 单条全文：`session + ts` 是记录的唯一键（面板已有的行键）。点开某条时才取，列表不带大字段
+        const ts = paramOf(req, 'ts')
+        if (sessionId !== null && ts !== null) {
+          const full = generations.find((entry) => entry.session === sessionId && String(entry.ts) === ts)
+          sendJson(res, 200, { generations: full === undefined ? [] : [full] })
+          return
+        }
         let limit = 20
-        try {
-          const value = Number(new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('limit'))
-          if (Number.isFinite(value) && value > 0) limit = Math.min(GEN_MEMORY_LIMIT, Math.round(value))
-        } catch { /* 用默认值 */ }
+        const requested = Number(queryOf(req).get('limit'))
+        if (Number.isFinite(requested) && requested > 0) limit = Math.min(GEN_MEMORY_LIMIT, Math.round(requested))
         const records = (sessionId === null
           ? generations
           : generations.filter((entry) => entry.session === sessionId)).slice(0, limit)
-        sendJson(res, 200, { generations: records })
+        sendJson(res, 200, { generations: records.map(slimGeneration) })
       },
     })
 
@@ -1465,7 +1781,7 @@ export function apply(ctx, config) {
           const patch = body && typeof body === 'object' && body.config && typeof body.config === 'object'
             ? body.config
             : body
-          const allowed = ['enabled', 'style', 'customPrompt', 'followSessionModel', 'provider', 'model', 'reasoningEffort', 'maxChars', 'temperature', 'includeInterrupted', 'includeReasoning', 'fallback', 'historyPerSession']
+          const allowed = ['enabled', 'style', 'customPrompt', 'followSessionModel', 'provider', 'model', 'reasoningEffort', 'maxChars', 'temperature', 'timeoutSeconds', 'includeInterrupted', 'includeReasoning', 'redact', 'fallback', 'historyPerSession']
           const next = {}
           for (const key of allowed) {
             if (Object.prototype.hasOwnProperty.call(patch, key)) next[key] = patch[key]
@@ -1473,6 +1789,14 @@ export function apply(ctx, config) {
           if (Object.keys(next).length === 0) {
             sendJson(res, 400, { error: 'no recognized fields' })
             return
+          }
+          // 超时秒数必须是数字并落在合法范围内（设置卡已夹过，这里是接口自己的兜底）
+          if ('timeoutSeconds' in next) {
+            if (typeof next.timeoutSeconds !== 'number' || !Number.isFinite(next.timeoutSeconds)) {
+              sendJson(res, 400, { error: 'timeoutSeconds must be a number' })
+              return
+            }
+            next.timeoutSeconds = clampTimeoutSeconds(next.timeoutSeconds)
           }
           await editor.edit(entry, (current) => ({ ...current, ...next }))
           sendJson(res, 200, { config: currentConfig(config) })

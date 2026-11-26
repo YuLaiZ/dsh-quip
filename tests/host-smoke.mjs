@@ -6,6 +6,9 @@
  * 走一遍解析与 import；假包的 `appendPluginRecord` 可切换为抛品牌检查错误，
  * 用来验证「写入失败必须可见」这条路径——这正是旧测试全绿而真实写入
  * 三次失败的原因。
+ *
+ * 夹具使用已安装宿主的对象形状 finish（`reason: { kind, failure? }`）——
+ * 宿主协议里不存在字符串 reason 与 chunk 顶层 error 字段。
  */
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
@@ -13,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { apply, pluginRecordOf, isCurrentQuipRecord, textOfRecord, PURGED_RECORD_TYPE, candidateSessionModules, probeHostSessionUrl } from '../src/index.js'
+import { SKIP_SENTINEL } from '../src/styles.js'
 
 // ---- 临时目录：假 dsh-session 包 + 生成记录目录 ----
 const root = mkdtempSync(join(tmpdir(), 'dsh-quip-test-'))
@@ -48,13 +52,15 @@ const routes = new Map()
 const listeners = []
 let generatedCalls = []
 let streamMode = 'ok'
+/** POST /config 走到的编辑函数（fn(current) 的返回值），验证写回路径。 */
+const configEdits = []
 
 const okStream = (text) => (async function* () {
   for (const piece of text.match(/./gu) ?? []) {
     yield { type: 'text-delta', index: 0, text: piece }
   }
   yield { type: 'usage', usage: { inputTokens: 321, outputTokens: 12, totalTokens: 333 } }
-  yield { type: 'finish', reason: 'stop' }
+  yield { type: 'finish', reason: { kind: 'stop' } }
 })()
 
 const ctx = {
@@ -65,7 +71,12 @@ const ctx = {
     // 注意宿主里必须用 resolveModelInfo——resolveModel 是基类占位，永远不带 reasoning。
     resolveModelInfo: async (provider, model) => ({
       provider, id: model, name: model,
-      ...(model === 'deepseek-reasoner' ? { reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }, { id: 'max', name: 'Max' }], defaultEffort: 'max' } } : {}),
+      ...(model === 'deepseek-reasoner' ? {
+        reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }, { id: 'max', name: 'Max' }], defaultEffort: 'max' },
+        // provider 公布的窗口与不传上限时适配器代用的输出上限（生成记录的条件字段）
+        context: { contextWindow: 128000 },
+        defaultMaxTokens: 8192,
+      } : {}),
     }),
     stream: (options) => {
       generatedCalls.push(options)
@@ -76,25 +87,93 @@ const ctx = {
         })()
       }
       if (streamMode === 'fail') {
+        // 失败写在 finish chunk 上（宿主会把适配器异常规范化成 finish，不抛给消费者）
         return (async function* () {
-          yield { type: 'finish', reason: 'error' }
-          throw new Error('provider down')
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'provider down', code: 'PROVIDER_ERROR' } } }
         })()
       }
       if (streamMode === 'empty') {
         // 额度耗尽这类失败的真实形态：流正常结束、零文本、usage 全 0、不抛异常
         return (async function* () {
           yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }
-          yield { type: 'finish', reason: 'stop' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
         })()
       }
       if (streamMode === 'finishError') {
         // 失败写在 finish chunk 上（adapter 规范化错误），不抛异常
         return (async function* () {
-          yield { type: 'finish', reason: 'error', error: new Error('insufficient quota') }
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'insufficient quota', code: 'ACCOUNT_QUOTA_EXCEEDED', status: 429 } } }
         })()
       }
       if (streamMode === 'quoted') return okStream('"把引号也当成我的一部分"')
+      if (streamMode === 'errorPartial') {
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '半句还没说完' }
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'insufficient quota', code: 'ACCOUNT_QUOTA_EXCEEDED', status: 429 } } }
+        })()
+      }
+      if (streamMode === 'abortedPartial') {
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '半句还没说完' }
+          yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'cancelled', code: 'ABORTED' } } }
+        })()
+      }
+      if (streamMode === 'maxTokensPartial') {
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '撞上限的半句' }
+          yield { type: 'finish', reason: { kind: 'max-tokens' } }
+        })()
+      }
+      if (streamMode === 'errorEmpty') {
+        return (async function* () {
+          yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'bad key', code: 'INVALID_CREDENTIAL', status: 401 } } }
+        })()
+      }
+      if (streamMode === 'noFinishEmpty') {
+        // usage 后流直接结束，没有 finish chunk
+        return (async function* () {
+          yield { type: 'usage', usage: { inputTokens: 5, outputTokens: 0 } }
+        })()
+      }
+      if (streamMode === 'noFinishText') {
+        // 有文本但流直接结束，没有 finish chunk
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '没有终态的一句' }
+        })()
+      }
+      if (streamMode === 'skipOnError') {
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: SKIP_SENTINEL }
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'down', code: 'PROVIDER_ERROR' } } }
+        })()
+      }
+      if (streamMode === 'skipOnStop') {
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: SKIP_SENTINEL }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      }
+      if (streamMode === 'reasoning') {
+        return (async function* () {
+          yield { type: 'reasoning-delta', index: 0, text: '先想想' }
+          yield { type: 'text-delta', index: 0, text: '（叉腰）想好了' }
+          yield { type: 'usage', usage: { inputTokens: 9, outputTokens: 7, reasoningTokens: 3, cachedTokens: 11 } }
+          yield { type: 'finish', reason: { kind: 'stop' }, replayState: { response: { id: 'resp_1' } } }
+        })()
+      }
+      if (streamMode === 'throwsLlmError') {
+        // 迭代中途抛出带 failure 的异常（宿主 LlmError 的形状）
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '半句' }
+          throw Object.assign(new Error('stream closed'), { failure: { message: 'stream closed', code: 'STREAM_CLOSED' } })
+        })()
+      }
+      if (streamMode === 'throwsPlain') {
+        return (async function* () {
+          throw new Error('boom')
+        })()
+      }
       return okStream('（叉腰）这波我自己都觉得很可以')
     },
   },
@@ -118,7 +197,11 @@ const ctx = {
     }
     if (name === 'sessionQuery') {
       // 冷读与「轮次中途重载后的素材补折」共用：按会话 id 给不同夹具
-      return { readSession: async (id) => ({ events: id === 'session-rebuild' ? rebuildEvents : coldLogEvents }) }
+      return { readSession: async (id) => ({ events: id === 'session-rebuild' ? rebuildEvents : id === 'session-rebuild2' ? rebuildEvents2 : coldLogEvents }) }
+    }
+    if (name === 'configEditor') {
+      // /config 写回：edit 收到 entry 与 fn(current)，fn 的返回值就是新配置
+      return { edit: async (_entry, fn) => { configEdits.push(fn(config)) } }
     }
     return undefined
   },
@@ -158,6 +241,16 @@ const rebuildEvents = [
   { type: 'user/message', seq: 21, time: Date.now() - 3000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '补折轮次的用户发言' }] } },
   { type: 'assistant/message', seq: 28, time: Date.now() - 1000, data: { turn: 5, step: 1, message: { id: 'asst-rebuild', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [{ type: 'text', text: '补折轮次的回复' }] } } },
   { type: 'step/end', seq: 28.5, time: Date.now() - 900, data: { turn: 5, step: 3 } },
+]
+
+// 流程 10 补折场景的夹具：另一条会话日志，两条各带思考与正文的回复 + 一次工具调用，
+// 同样故意不含 turn/end（模拟尚未持久化）。两条非空思考 → 素材里首尾各一行。
+const rebuildEvents2 = [
+  { type: 'turn/start', seq: 300, time: Date.now() - 2000, data: { turn: 80 } },
+  { type: 'assistant/message', seq: 301, time: Date.now() - 1500, data: { turn: 80, step: 1, message: { id: 'asst-rebuild2-a', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [{ type: 'reasoning', text: '补折2第一步的思考' }, { type: 'text', text: '补折2第一步的正文' }] } } },
+  { type: 'tool/call', seq: 302, time: Date.now() - 1200, data: { name: 'grep' } },
+  { type: 'assistant/message', seq: 303, time: Date.now() - 1000, data: { turn: 80, step: 2, message: { id: 'asst-rebuild2-b', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [{ type: 'reasoning', text: '补折2第二步的思考' }, { type: 'text', text: '补折2第二步的正文' }] } } },
+  { type: 'step/end', seq: 304, time: Date.now() - 900, data: { turn: 80, step: 2 } },
 ]
 
 const config = {
@@ -203,7 +296,7 @@ const config = {
 const LEGACY_TS = new Date(2024, 5, 1, 12, 0, 0).getTime()
 mkdirSync(process.env.QUIP_DATA_DIR, { recursive: true })
 writeFileSync(join(process.env.QUIP_DATA_DIR, 'generations.jsonl'),
-  JSON.stringify({ ts: LEGACY_TS, session: 'session-legacy', turn: 90001, raw: 'ignored', cleaned: '旧格式的最终文本', source: 'model' }) + '\n')
+  JSON.stringify({ ts: LEGACY_TS, session: 'session-legacy', turn: 90001, raw: 'ignored', cleaned: '旧格式的最终文本', source: 'model', maxTokens: 128 }) + '\n')
 // 已满的文件：名字要排在迁移文件之后（= 目录里最新），这样下一条记录才会另起新文件
 const PREFILL_NAME = 'generations-20250101-000000.jsonl'
 mkdirSync(join(process.env.QUIP_DATA_DIR, 'generations'), { recursive: true })
@@ -229,6 +322,34 @@ const emit = (event, sess = session) => {
   }
 }
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** 取某轮的完整生成记录：列表里按 turn 找到它的 ts，再按 session + ts 取全文。 */
+const fullTraceOf = async (turn, sessionId = 'session-test-1') => {
+  const list = makeRes()
+  await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=100' }, list)
+  const slim = JSON.parse(list.body).generations.find((entry) => entry.turn === turn && entry.session === sessionId)
+  if (!slim) return undefined
+  const full = makeRes()
+  await routes.get('/api/quip/v1/generations').handler({ url: `/api/quip/v1/generations?session=${encodeURIComponent(sessionId)}&ts=${slim.ts}` }, full)
+  return JSON.parse(full.body).generations[0]
+}
+
+/** 发一个 POST /config（带 JSON body），返回 { status, body }。 */
+const postConfig = async (payload) => {
+  const res = makeRes()
+  const body = Buffer.from(JSON.stringify(payload))
+  const req = {
+    method: 'POST',
+    url: '/api/quip/v1/config',
+    on(event, fn) {
+      // body 分片异步喂给 readJsonBody：先 data 后 end
+      if (event === 'data') setTimeout(() => fn(body), 0)
+      if (event === 'end') setTimeout(fn, 2)
+    },
+  }
+  await routes.get('/api/quip/v1/config').handler(req, res)
+  return { status: res.statusCode, body: res.body }
+}
 
 // ---- 流程 1：正常生成 + 写入成功 ----
 emit({ type: 'turn/start', time: Date.now() - 4000, data: { turn: 1 }, seq: 1 })
@@ -343,7 +464,7 @@ assert.deepEqual(fakeSession.calls[0].data.usage, { inputTokens: 321, outputToke
   assert.ok(Array.isArray(body.persistence.candidates) && body.persistence.candidates.length >= 1)
 }
 
-// generations 端点
+// generations 端点：列表瘦身（大字段换成四个字数），点开某条时才按 session + ts 取全文
 {
   const res = makeRes()
   await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=10' }, res)
@@ -352,8 +473,48 @@ assert.deepEqual(fakeSession.calls[0].data.usage, { inputTokens: 321, outputToke
   assert.equal(record.source, 'model')
   assert.equal(record.text, '（叉腰）这波我自己都觉得很可以')
   assert.equal('raw' in record, false, 'one text field only')
-  assert.ok(record.material.includes('帮我修一下登录页'))
-  assert.ok(record.systemPrompt.includes('俏皮'))
+  // 列表不带五个大字段，改带四个字数
+  for (const field of ['material', 'systemPrompt', 'rawText', 'reasoningText', 'replayState']) {
+    assert.equal(field in record, false, `list drops the large field ${field}`)
+  }
+  assert.ok(record.materialChars > 0, 'materialChars hints at the full text')
+  assert.ok(record.systemPromptChars > 0, 'systemPromptChars hints at the full prompt')
+  assert.equal(record.rawTextChars, record.text.length, 'model output has no surrounding whitespace → raw length equals the shown text')
+  assert.equal(record.reasoningTextChars, 0, 'no reasoning chunks this turn')
+  // 单条全文：session + ts 定位；ts 查不到时给空数组
+  const t1 = await fullTraceOf(1)
+  assert.ok(t1, 'full trace of turn 1 retrievable via session + ts')
+  assert.ok(t1.material.includes('帮我修一下登录页'), 'full trace carries the material')
+  assert.ok(t1.systemPrompt.includes('俏皮'), 'full trace carries the system prompt')
+  {
+    const miss = makeRes()
+    await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?session=session-test-1&ts=1' }, miss)
+    assert.deepEqual(JSON.parse(miss.body).generations, [], 'an unknown ts yields an empty list')
+  }
+  // —— 流程 1 的完整生成记录：新增 trace 字段逐项核对 ——
+  assert.equal(t1.rawText, '（叉腰）这波我自己都觉得很可以', 'rawText is the pre-trim model output')
+  assert.equal(t1.reasoningText, '', 'no reasoning chunks → empty string')
+  assert.equal(typeof t1.timing, 'object')
+  assert.deepEqual(Object.keys(t1.timing).sort(), ['firstChunkMs', 'firstTextMs', 'persistMs', 'rebuildMs', 'routeMs', 'streamMs'], 'timing always carries all six keys')
+  assert.equal(t1.timing.rebuildMs, null, 'live folding does not rebuild from the session log')
+  assert.equal(typeof t1.timing.persistMs, 'number', 'the session log was written')
+  assert.equal(typeof t1.timing.firstTextMs, 'number', 'text chunks arrived')
+  assert.equal(t1.chunks, t1.text.length + 2, 'okStream yields one chunk per char, plus usage and finish')
+  assert.equal(t1.timedOut, false, 'a fast turn does not trip the timeout')
+  assert.equal(t1.timeoutMs, 150, 'QUIP_TIMEOUT_MS is the effective threshold')
+  assert.equal(t1.turnReason, 'completed', 'the turn/end reason is recorded')
+  assert.equal(t1.configuredReasoningEffort, 'auto', 'the pre-resolution configured effort is recorded')
+  assert.equal(t1.reasoningEffort, null, 'auto routing without an exact model resolves no effort')
+  assert.equal(t1.effortsOffered, null, 'no exact model → no declared efforts')
+  assert.equal(t1.providerDefaultEffort, null, 'no exact model → no provider default effort')
+  assert.equal('modelContextWindow' in t1, false, 'no model metadata → the key does not exist')
+  assert.equal(t1.maxChars, 40, 'maxChars snapshot')
+  assert.equal(t1.includeReasoning, true, 'includeReasoning snapshot')
+  assert.equal(t1.fallbackEnabled, true, 'fallbackEnabled mirrors the fallback config')
+  assert.equal(t1.redacted, true, 'redacted mirrors the redact config')
+  assert.equal(t1.pluginVersion, '0.1.0')
+  assert.equal(t1.hostVersion, process.env.DSH_CLIENT_VERSION ?? null, 'hostVersion comes from DSH_CLIENT_VERSION, else null')
+  assert.equal('maxTokens' in t1, false, 'maxTokens is a dead field: new records never carry it')
 }
 
 // 冷读恢复：只认当前格式（v === 1 且带 message.content）
@@ -415,6 +576,13 @@ assert.equal(fakeSession.calls.length, 2, 'second append attempted (not short-ci
 }
 fakeSession.state.mode = 'ok'
 
+// 写入失败也算「调用过写会话日志」：persistMs 是非负数字，而不是 null
+{
+  const t2 = await fullTraceOf(2)
+  assert.ok(t2, 'turn 2 traced')
+  assert.equal(typeof t2.timing.persistMs, 'number', 'persistMs counts even a failed session-log append')
+}
+
 // ---- 流程 3：SSE 推送 ----
 {
   const res = makeRes()
@@ -473,6 +641,8 @@ await wait(120)
   assert.equal(rec6.plugin.outcome, 'error', 'plugin.outcome keeps why the model call fell back')
   assert.equal(rec6.usage, null, 'fail stream yields no usage chunk → usage is null, not fabricated')
   assert.equal(rec6.request.provider, 'deepseek', 'request still records the route that was attempted')
+  assert.equal(rec6.plugin.finish, 'error', 'finish kind is recorded even when the stream failed')
+  assert.deepEqual(rec6.plugin.failure, { code: 'PROVIDER_ERROR', message: 'provider down' }, 'failure summary mirrors the finish failure')
   // 本轮没有 assistant/message：锚点 seq/id 为 null，但 turn/end 的 seq（直接前驱）仍有
   assert.deepEqual(rec6.after, { seq: null, messageId: null, turnEndSeq: 20 }, 'no assistant reply this turn → anchor seq null, turnEndSeq still set')
 }
@@ -494,6 +664,17 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
   // 中途被中止的部分输出不再单独保留：text 就是用户最终看到的那句（兜底句），原因看 error
   assert.notEqual(t7.text, '半句', 'partial output is not what the user saw')
   assert.ok(t7.text !== '', 'fallback text is the final text')
+  // 插件自己的超时信号先打断：finish 没拿到，失败事实也不存在
+  assert.equal(t7.finishKind, null, 'timeout aborts before any finish chunk arrives')
+  assert.equal(t7.failure, null, 'timeout carries no failure fact')
+  // 超时的完整记录：timedOut / rawText / timing 细节只在全文里可读
+  const full7 = await fullTraceOf(7)
+  assert.ok(full7, 'turn 7 full trace retrievable via session + ts')
+  assert.equal(full7.timedOut, true, 'the plugin timeout signal fired')
+  assert.equal(full7.timeoutMs, 150, 'timeoutMs records the effective threshold')
+  assert.equal(full7.rawText, '半句', 'rawText keeps the received-but-never-shown partial text')
+  assert.equal(typeof full7.timing.firstTextMs, 'number', 'the partial text arrived before the abort')
+  assert.ok(full7.timing.streamMs >= 150, 'streamMs covers at least the timeout window')
 }
 // 超时后仍按 fallback 配置给出一句，不丢轮
 {
@@ -517,6 +698,8 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
     assert.ok(t11, 'turn 11 traced')
     assert.equal(t11.outcome, 'empty', 'no-text stream is recorded as empty, not ok')
     assert.match(t11.error, /returned no text/)
+    assert.equal(t11.finishKind, 'stop', 'the empty stream did end with a stop finish')
+    assert.equal(t11.failure, null, 'a stop finish carries no failure')
     // 兜底仍然给出一句，用户不至于什么都没有
     assert.equal(t11.source, 'fallback')
     assert.ok(t11.text !== '', 'fallback still supplies a line')
@@ -543,6 +726,15 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
     const t12 = JSON.parse(res.body).generations.find((entry) => entry.turn === 12)
     assert.equal(t12.outcome, 'error', 'a finish-chunk error is a failure')
     assert.match(t12.error, /insufficient quota/, 'the model error survives into the trace')
+    assert.equal(t12.finishKind, 'error', 'finish kind records the failure ending')
+    assert.deepEqual(t12.failure, { message: 'insufficient quota', code: 'ACCOUNT_QUOTA_EXCEEDED', status: 429 }, 'failure is kept verbatim')
+  }
+  {
+    // 失败事实也精简进会话日志 record，让日志读者不用回查生成记录就能归因
+    const rec12 = fakeSession.calls.map((c) => c.data).find((d) => d?.turn === 12)
+    assert.ok(rec12, 'turn 12 record was appended')
+    assert.equal(rec12.plugin.finish, 'error', 'record carries the finish kind')
+    assert.deepEqual(rec12.plugin.failure, { code: 'ACCOUNT_QUOTA_EXCEEDED', message: 'insufficient quota', status: 429 }, 'record failure is the trimmed summary')
   }
   streamMode = 'ok'
 }
@@ -566,12 +758,33 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
   assert.equal(rec8.request.reasoningEffort, 'low')
   assert.equal(rec8.message.source.provider, 'deepseek')
   assert.equal(rec8.message.source.model, 'deepseek-reasoner')
+  // 生成记录带模型元数据与等级解析的两端：配置值（解析前）与实际生效值（解析后）
+  {
+    const res = makeRes()
+    await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=50' }, res)
+    const t8 = JSON.parse(res.body).generations.find((entry) => entry.turn === 8)
+    assert.ok(t8, 'turn 8 traced')
+    assert.equal(t8.configuredReasoningEffort, 'auto', 'the configured value is recorded before resolution')
+    assert.equal(t8.reasoningEffort, 'low', 'auto resolves to the lowest declared effort')
+    assert.deepEqual(t8.effortsOffered, ['low', 'high', 'max'], 'the declared efforts are recorded low to high')
+    assert.equal(t8.providerDefaultEffort, 'max', 'the provider default effort is recorded')
+    assert.equal(t8.modelContextWindow, 128000, 'contextWindow from resolveModelInfo lands in the trace')
+    assert.equal(t8.modelDefaultMaxTokens, 8192, 'defaultMaxTokens from resolveModelInfo lands in the trace')
+  }
   config.reasoningEffort = 'high'
   emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn: 9 }, seq: 27 })
   emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第九轮' }] }, seq: 28 })
   emit({ type: 'turn/end', time: Date.now(), data: { turn: 9, reason: { kind: 'completed' } }, seq: 29 })
   await wait(120)
   assert.equal(generatedCalls[before7 + 1].reasoningEffort, 'high', 'explicit effort is passed through')
+  {
+    const res = makeRes()
+    await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=50' }, res)
+    const t9 = JSON.parse(res.body).generations.find((entry) => entry.turn === 9)
+    assert.ok(t9, 'turn 9 traced')
+    assert.equal(t9.configuredReasoningEffort, 'high', 'an explicit config effort is recorded as configured')
+    assert.equal(t9.reasoningEffort, 'high', 'an explicit config effort is used as-is')
+  }
   config.reasoningEffort = 'auto'
   config.provider = 'auto'
   config.model = 'auto'
@@ -689,11 +902,390 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
   assert.equal(rec.after.seq, 28, 'after.seq is the last assistant/message read from the log')
   assert.equal(rec.after.messageId, 'asst-rebuild')
   assert.equal(rec.after.turnEndSeq, 30, 'turnEndSeq comes from the live turn/end event')
+  // 补折路径的 timing.rebuildMs 是非负数字（与实时折叠的 null 形成对照）
+  const t5 = await fullTraceOf(5, 'session-rebuild')
+  assert.ok(t5, 'turn 5 (rebuilt) traced')
+  assert.ok(typeof t5.timing.rebuildMs === 'number' && t5.timing.rebuildMs >= 0, 'rebuildMs is a non-negative number on the rebuilt path')
   // 找不到本轮 turn/start（日志里没有这一轮）→ 安静放弃，不抛错、不生成
   const before2 = generatedCalls.length
   emit({ type: 'turn/end', time: Date.now(), data: { turn: 77, reason: { kind: 'completed' } }, seq: 40 }, sess)
   await wait(80)
   assert.equal(generatedCalls.length, before2, 'a turn/end whose turn is absent from the log is dropped quietly')
+}
+
+// ---- 流程 10：素材逐字原样、思考取首尾两条、工具计次、脱敏开关 ----
+{
+  streamMode = 'ok'
+  // 夹具全部是普通中文句子，故意不含 sk- / 长 hex / key=value 等会被脱敏的形态（脱敏另有 65/66 对照场景）。
+  // R4 的「继续想。」重复 210 次 → 思考 870 字（真正超过八百字），轮 60 的素材总长才会明显大于
+  // 生成记录曾经的 2000 字截断上限——这是「全文落 trace」断言能成立的前提。
+  const USER_LONG = '请帮我把登录页的滚动条修一下，顺便看看提交按钮的样式。'.repeat(22) + '用户发言结尾标记'
+  const S1 = '第一步的正文，先看 CSS。'
+  const S2 = '第二步的正文，改了容器高度。'
+  const S3 = '第三步的正文，跑了一遍回归。'
+  const S4 = '第四步的正文，这里故意写一段超过三百字的说明：' + '补充说明。'.repeat(60) + '第四步结尾标记'
+  const R1 = '第一步的思考：滚动条颜色可能被覆盖了。'
+  const R2 = '第二步的思考：也可能是容器高度。'
+  const R3 = '第三步的思考：回归应该没问题。'
+  const R4 = '第四步的思考：这里写一段超过八百字的思考，' + '继续想。'.repeat(210) + '第四步思考结尾标记'
+  const REASONING_SECTION = '【本轮助手思考过程（模型内心的犹豫、绕路与自我纠正；自评时可以引用）】'
+  const TOOLS_LINE = '【本轮工具使用】共 5 次：read×2、edit×1、bash×2'
+  const REPLY_4STEPS = '【本轮助手回复】\n第 1 步：' + S1 + '\n第 2 步：' + S2 + '\n第 3 步：' + S3 + '\n第 4 步：' + S4
+  let seq = 200
+  // 轮 60 与轮 61 用同一套夹具，只差 includeReasoning 开关
+  const runFourStepTurn = async (turn) => {
+    emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn }, seq: seq++ })
+    emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: USER_LONG }] }, seq: seq++ })
+    const steps = [[R1, S1], [R2, S2], [R3, S3], [R4, S4]]
+    for (let i = 0; i < steps.length; i++) {
+      emit({ type: 'assistant/message', data: { turn, step: i + 1, message: { id: `asst-${turn}-${i + 1}`, content: [
+        { type: 'reasoning', text: steps[i][0] },
+        { type: 'text', text: steps[i][1] },
+      ] } }, seq: seq++ })
+    }
+    for (const name of ['read', 'edit', 'read', 'bash', 'bash']) {
+      emit({ type: 'tool/call', data: { name }, seq: seq++ })
+    }
+    emit({ type: 'step/end', data: { turn, step: 4 }, seq: seq++ })
+    emit({ type: 'turn/end', time: Date.now(), data: { turn, reason: { kind: 'completed' } }, seq: seq++ })
+    await wait(150)
+  }
+
+  // 轮 60：四步轮次，includeReasoning 开、脱敏开——全文逐字、思考首尾两条、工具按名计次
+  const before60 = generatedCalls.length
+  await runFourStepTurn(60)
+  assert.equal(generatedCalls.length, before60 + 1, '60: generated')
+  const material60 = generatedCalls[before60].messages[0].content[0].text
+  assert.ok(material60.includes('【本轮用户发言】\n' + USER_LONG), '60: user text verbatim, no truncation')
+  assert.ok(!material60.includes('摘要') && !material60.includes('摘录'), '60: section titles no longer say 摘要/摘录')
+  // 整段连续出现 = 无截断、无乱序、无插入
+  assert.ok(material60.includes(REPLY_4STEPS), '60: all four reply steps verbatim and in order')
+  // 思考只取首尾两条：第一条与最后一条全文；中间步骤的思考不进素材
+  assert.ok(material60.includes(REASONING_SECTION + '\n第 1 步：' + R1 + '\n第 4 步：' + R4), '60: first and last reasoning only, full text')
+  assert.ok(!material60.includes(R2) && !material60.includes(R3), '60: middle-step reasoning stays out')
+  assert.ok(material60.includes(TOOLS_LINE), '60: tool counts by name in first-seen order, no 8-name cap')
+  assert.ok(material60.indexOf('【本轮用户发言】') < material60.indexOf('【本轮助手回复】')
+    && material60.indexOf('【本轮助手回复】') < material60.indexOf('【本轮工具使用】')
+    && material60.indexOf('【本轮工具使用】') < material60.indexOf('【本轮耗时】')
+    && material60.indexOf('【本轮耗时】') < material60.indexOf('【本轮助手思考过程'), '60: order user → reply → tools → duration → reasoning')
+  assert.ok(material60.length > 2000, '60: the material is well over the old 2000-char trace cap')
+  const t60 = await fullTraceOf(60)
+  assert.ok(t60, '60: traced')
+  assert.equal(t60.material, material60, '60: trace stores the full material, not a 2000-char slice')
+
+  // 轮 61：同样的四步，includeReasoning 关——思考段整个不出现，其余各段不变
+  config.includeReasoning = false
+  const before61 = generatedCalls.length
+  await runFourStepTurn(61)
+  assert.equal(generatedCalls.length, before61 + 1, '61: generated')
+  const material61 = generatedCalls[before61].messages[0].content[0].text
+  assert.ok(!material61.includes('思考过程') && !material61.includes(R1) && !material61.includes(R4), '61: reasoning section omitted entirely when disabled')
+  assert.ok(material61.includes('【本轮用户发言】\n' + USER_LONG), '61: user text verbatim')
+  assert.ok(material61.includes(REPLY_4STEPS), '61: reply steps verbatim')
+  assert.ok(material61.includes(TOOLS_LINE), '61: tool counts unchanged')
+  config.includeReasoning = true
+
+  // 轮 62：单步轮次、没有 data.step——同一条思考只出现一次，正文不带「第 N 步：」
+  emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn: 62 }, seq: seq++ })
+  emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '单步轮次的用户发言' }] }, seq: seq++ })
+  emit({ type: 'assistant/message', data: { message: { id: 'asst-62-1', content: [
+    { type: 'reasoning', text: '只有一步的思考' },
+    { type: 'text', text: '只有一步的正文' },
+  ] } }, seq: seq++ })
+  emit({ type: 'turn/end', time: Date.now(), data: { turn: 62, reason: { kind: 'completed' } }, seq: seq++ })
+  await wait(150)
+  const material62 = generatedCalls.at(-1).messages[0].content[0].text
+  assert.equal(material62.split('只有一步的思考').length - 1, 1, '62: the single reasoning appears exactly once (first === last)')
+  assert.ok(material62.includes('【本轮助手回复】\n只有一步的正文'), '62: no step label without data.step')
+
+  // 轮 63：整轮没有思考——渲染占位句而不是空段
+  emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn: 63 }, seq: seq++ })
+  emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '无思考轮次的用户发言' }] }, seq: seq++ })
+  emit({ type: 'assistant/message', data: { message: { id: 'asst-63-1', content: [{ type: 'text', text: '没有思考的正文' }] } }, seq: seq++ })
+  emit({ type: 'turn/end', time: Date.now(), data: { turn: 63, reason: { kind: 'completed' } }, seq: seq++ })
+  await wait(150)
+  const material63 = generatedCalls.at(-1).messages[0].content[0].text
+  assert.ok(material63.includes('（本轮无思考过程）'), '63: no-reasoning placeholder shown')
+
+  // 轮 64：120 步大轮次——回复逐字无截断，同名工具计次不封顶，trace 全文等长
+  emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn: 64 }, seq: seq++ })
+  emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '百步轮次的用户发言' }] }, seq: seq++ })
+  for (let i = 1; i <= 120; i++) {
+    emit({ type: 'assistant/message', data: { turn: 64, step: i, message: { id: `asst-64-${i}`, content: [{ type: 'text', text: `第${i}步正文内容，这一步做了事情。` }] } }, seq: seq++ })
+  }
+  for (let i = 0; i < 120; i++) {
+    emit({ type: 'tool/call', data: { name: 'read' }, seq: seq++ })
+  }
+  emit({ type: 'step/end', data: { turn: 64, step: 120 }, seq: seq++ })
+  emit({ type: 'turn/end', time: Date.now(), data: { turn: 64, reason: { kind: 'completed' } }, seq: seq++ })
+  await wait(150)
+  const material64 = generatedCalls.at(-1).messages[0].content[0].text
+  const expectedReply = Array.from({ length: 120 }, (_, i) => `第 ${i + 1} 步：第${i + 1}步正文内容，这一步做了事情。`).join('\n')
+  assert.ok(material64.includes('【本轮助手回复】\n' + expectedReply), '64: all 120 steps verbatim and in order')
+  assert.ok(material64.includes('共 120 次：read×120'), '64: 120 same-name calls counted, no cap')
+  assert.ok(material64.length > 120 * 20, '64: a 120-step material is far larger than the old caps allowed')
+  const t64 = await fullTraceOf(64)
+  assert.ok(t64, '64: traced')
+  assert.equal(t64.material.length, material64.length, '64: the trace stores the material in full')
+
+  const SECRET_TEXT = '我的密钥是 sk-abcdefghijklmnopqrstuvwx 请保管好'
+  // 轮 65：脱敏关——原文（含密钥形态）逐字进素材，trace 快照 redact=false
+  config.redact = false
+  emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn: 65 }, seq: seq++ })
+  emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: SECRET_TEXT }] }, seq: seq++ })
+  emit({ type: 'turn/end', time: Date.now(), data: { turn: 65, reason: { kind: 'completed' } }, seq: seq++ })
+  await wait(150)
+  const material65 = generatedCalls.at(-1).messages[0].content[0].text
+  assert.ok(material65.includes('sk-abcdefghijklmnopqrstuvwx'), '65: redact off → the secret shape survives verbatim')
+  const t65 = await fullTraceOf(65)
+  assert.ok(t65, '65: traced')
+  assert.equal(t65.redacted, false, '65: trace snapshots redact=off')
+  // 轮 66：脱敏开（对照）——密钥形态被替换为 [redacted]
+  config.redact = true
+  emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn: 66 }, seq: seq++ })
+  emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: SECRET_TEXT }] }, seq: seq++ })
+  emit({ type: 'turn/end', time: Date.now(), data: { turn: 66, reason: { kind: 'completed' } }, seq: seq++ })
+  await wait(150)
+  const material66 = generatedCalls.at(-1).messages[0].content[0].text
+  assert.ok(!material66.includes('sk-abcdefghijklmnopqrstuvwx'), '66: redact on → the secret shape is replaced')
+  assert.ok(material66.includes('[redacted]'), '66: the redaction marker appears')
+  const t66 = await fullTraceOf(66)
+  assert.ok(t66, '66: traced')
+  assert.equal(t66.redacted, true, '66: trace snapshots redact=on')
+
+  // 补折路径：session-rebuild2 的内存素材缺失，只发 turn/end 触发从日志补折
+  const sess2 = { id: 'session-rebuild2', header: { origin: null, delegationDepth: 0 } }
+  const beforeR2 = generatedCalls.length
+  emit({ type: 'turn/end', time: Date.now(), data: { turn: 80, reason: { kind: 'completed' } }, seq: seq++ }, sess2)
+  await wait(150)
+  assert.equal(generatedCalls.length, beforeR2 + 1, 'rebuild2: turn/end without in-memory material rebuilds from the log')
+  const materialR2 = generatedCalls.at(-1).messages[0].content[0].text
+  assert.ok(materialR2.includes('【本轮助手回复】\n第 1 步：补折2第一步的正文\n第 2 步：补折2第二步的正文'), 'rebuild2: both reply steps verbatim with step labels')
+  assert.ok(materialR2.includes(REASONING_SECTION), 'rebuild2: reasoning section present')
+  assert.ok(materialR2.includes('第 1 步：补折2第一步的思考\n第 2 步：补折2第二步的思考'), 'rebuild2: first and last reasoning both appear')
+  assert.ok(materialR2.includes('【本轮工具使用】共 1 次：grep×1'), 'rebuild2: tool counted by name')
+  const tR2 = await fullTraceOf(80, 'session-rebuild2')
+  assert.ok(tR2, 'rebuild2: traced')
+  assert.ok(typeof tR2.timing.rebuildMs === 'number', 'rebuild2: rebuildMs is a number on the rebuilt path')
+}
+
+// ---- 流程 6c：结束形态按宿主协议判定 ----
+{
+  let seq = 64
+  const runTurn = async (turn) => {
+    emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn }, seq: seq++ })
+    emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `第${turn}轮` }] }, seq: seq++ })
+    emit({ type: 'turn/end', time: Date.now(), data: { turn, reason: { kind: 'completed' } }, seq: seq++ })
+    await wait(150)
+  }
+  const scenarios = [
+    {
+      // 半句 + finish error：失败先于文本，半句绝不展示
+      mode: 'errorPartial', turn: 30,
+      check: (t, rec) => {
+        assert.equal(t.outcome, 'error', '30: finish error makes the call a failure')
+        assert.equal(t.source, 'fallback', '30: partial text is not shown')
+        assert.ok(t.text !== '半句还没说完' && t.text !== '', '30: the shown line is a fallback line')
+        assert.equal(t.finishKind, 'error', '30: finish kind is error')
+        assert.equal(t.failure.code, 'ACCOUNT_QUOTA_EXCEEDED', '30: failure carries the provider code')
+        assert.equal(t.failure.status, 429, '30: failure carries the http status verbatim')
+        assert.equal(rec.plugin.source, 'fallback', '30: record source is fallback')
+        assert.equal(rec.plugin.outcome, 'error', '30: record outcome is error')
+        assert.equal(rec.plugin.finish, 'error', '30: record finish is error')
+        assert.deepEqual(rec.plugin.failure, { code: 'ACCOUNT_QUOTA_EXCEEDED', message: 'insufficient quota', status: 429 }, '30: record failure is the trimmed summary')
+        assert.equal(rec.message.content[0].text, t.text, '30: record text equals the shown text')
+        assert.equal(rec.usage, null, '30: no usage chunk arrived → usage is null')
+        assert.ok('finish' in rec.plugin && 'failure' in rec.plugin, '30: record plugin carries finish and failure keys')
+      },
+    },
+    {
+      // 半句 + finish aborted：宿主侧中止，部分输出同样不展示
+      mode: 'abortedPartial', turn: 31,
+      check: (t, rec) => {
+        assert.equal(t.outcome, 'aborted', '31: finish aborted is its own outcome')
+        assert.equal(t.source, 'fallback', '31: partial text is not shown')
+        assert.ok(t.text !== '半句还没说完' && t.text !== '', '31: the shown line is a fallback line')
+        assert.equal(t.finishKind, 'aborted', '31: finish kind is aborted')
+        assert.match(t.error, /aborted/, '31: the error names the abort')
+        assert.match(t.error, /cancelled/, '31: the failure message survives into the error')
+        assert.equal(rec.plugin.finish, 'aborted', '31: record finish is aborted')
+        assert.deepEqual(rec.plugin.failure, { code: 'ABORTED', message: 'cancelled' }, '31: record failure has no status key')
+      },
+    },
+    {
+      // 半句 + finish max-tokens：宿主已经正常收尾，收到的文本照常展示
+      mode: 'maxTokensPartial', turn: 32,
+      check: (t, rec) => {
+        assert.equal(t.outcome, 'ok', '32: max-tokens with text is still ok')
+        assert.equal(t.source, 'model', '32: the text came from the model')
+        assert.equal(t.text, '撞上限的半句', '32: the partial text is shown verbatim')
+        assert.equal(t.finishKind, 'max-tokens', '32: finish kind records the limit ending')
+        assert.equal(t.failure, null, '32: max-tokens carries no failure')
+        assert.equal(rec.message.source.kind, 'model', '32: record is a model line')
+        assert.equal(rec.plugin.finish, 'max-tokens', '32: record finish is max-tokens')
+        assert.equal('failure' in rec.plugin, false, '32: no failure key on a clean ending')
+      },
+    },
+    {
+      // 无文本 + usage + finish error：与「正常结束但零输出」可区分——这是失败，不是 empty
+      mode: 'errorEmpty', turn: 33,
+      check: (t, rec) => {
+        assert.equal(t.outcome, 'error', '33: finish error is an error, not empty')
+        assert.notEqual(t.outcome, 'empty', '33: a failed call is not misrecorded as empty')
+        assert.equal(t.source, 'fallback', '33: fallback supplies the line')
+        assert.equal(t.finishKind, 'error', '33: finish kind is error')
+        assert.equal(t.failure.code, 'INVALID_CREDENTIAL', '33: failure carries the auth code')
+        assert.deepEqual(t.usage, { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, '33: the received usage is still recorded')
+        assert.deepEqual(rec.plugin.failure, { code: 'INVALID_CREDENTIAL', message: 'bad key', status: 401 }, '33: record failure is the trimmed summary')
+      },
+    },
+    {
+      // 无文本 + usage，流直接结束（无 finish）：这才是 empty；与 33 的 error 形成对照
+      mode: 'noFinishEmpty', turn: 34,
+      check: (t, rec) => {
+        assert.equal(t.outcome, 'empty', '34: a stream without finish and without text is empty')
+        assert.equal(t.finishKind, null, '34: no finish chunk → finishKind null')
+        assert.equal(t.failure, null, '34: no finish chunk → no failure')
+        assert.match(t.error, /finish=none/, '34: the error names the missing finish')
+      },
+    },
+    {
+      // 有文本，无 finish 流结束：宿主组装器按正常收尾对待，展示
+      mode: 'noFinishText', turn: 35,
+      check: (t) => {
+        assert.equal(t.outcome, 'ok', '35: text without a finish is still ok')
+        assert.equal(t.text, '没有终态的一句', '35: the text is shown verbatim')
+        assert.equal(t.finishKind, null, '35: no finish chunk → finishKind null')
+      },
+    },
+    {
+      // 哨兵 + finish error：失败先于 skip，哨兵救不了这轮
+      mode: 'skipOnError', turn: 36,
+      check: (t) => {
+        assert.equal(t.outcome, 'error', '36: failure wins over the skip sentinel')
+        assert.equal(t.source, 'fallback', '36: fallback supplies the line')
+      },
+    },
+    {
+      // 哨兵 + finish stop：模型自己决定不说，不写会话日志 record
+      mode: 'skipOnStop', turn: 37,
+      check: (t, rec) => {
+        assert.equal(t.outcome, 'skip', '37: sentinel with a clean stop is a skip')
+        assert.equal(t.source, 'skip', '37: nothing was shown')
+        assert.equal(t.finishKind, 'stop', '37: finish kind is stop')
+        assert.equal(rec, undefined, '37: skip writes no session-log record')
+      },
+    },
+    {
+      // 思考增量 + 正文 + usage + 带 replayState 的 stop
+      mode: 'reasoning', turn: 38,
+      check: async (t) => {
+        assert.equal(t.outcome, 'ok', '38: reasoning + text + stop is ok')
+        // usage 原样透传：provider 多报的字段（cachedTokens）也保留
+        assert.deepEqual(t.usage, { inputTokens: 9, outputTokens: 7, reasoningTokens: 3, cachedTokens: 11 }, '38: usage is passed through verbatim, extra fields kept')
+        assert.equal(t.finishKind, 'stop', '38: finish kind is stop')
+        // replayState / reasoningText 是大字段，只在单条全文里
+        const full = await fullTraceOf(38)
+        assert.ok(full, '38: full trace retrievable')
+        assert.equal(full.reasoningText, '先想想', '38: reasoning deltas concatenate into the trace')
+        assert.deepEqual(full.replayState, { response: { id: 'resp_1' } }, '38: replay state is kept verbatim')
+      },
+    },
+    {
+      // 迭代中途抛带 failure 的异常（宿主 LlmError 形状）：失败事实取 failure 原样
+      mode: 'throwsLlmError', turn: 39,
+      check: (t) => {
+        assert.equal(t.outcome, 'error', '39: a thrown stream is a failure')
+        assert.deepEqual(t.failure, { message: 'stream closed', code: 'STREAM_CLOSED' }, '39: the LlmError failure is kept verbatim')
+        assert.ok(t.text !== '半句', '39: partial text is not shown')
+        assert.match(t.error, /stream closed/, '39: the thrown message survives into the error')
+        assert.equal(t.finishKind, null, '39: no finish chunk arrived')
+      },
+    },
+    {
+      // 迭代中途抛普通异常：失败事实折成 { code: error.name, message }
+      mode: 'throwsPlain', turn: 40,
+      check: (t) => {
+        assert.equal(t.outcome, 'error', '40: a plain throw is a failure')
+        assert.deepEqual(t.failure, { code: 'Error', message: 'boom' }, '40: a plain error is folded into a failure fact')
+      },
+    },
+  ]
+  for (const { mode, turn, check } of scenarios) {
+    streamMode = mode
+    await runTurn(turn)
+    const res = makeRes()
+    await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=50' }, res)
+    const t = JSON.parse(res.body).generations.find((entry) => entry.turn === turn)
+    assert.ok(t, `${mode}: turn ${turn} traced`)
+    const rec = fakeSession.calls.map((c) => c.data).find((d) => d?.turn === turn)
+    await check(t, rec)
+  }
+  streamMode = 'ok'
+}
+
+// ---- 流程 6d：超时配置（QUIP_TIMEOUT_MS 优先）与没有兜底时的死字段 ----
+{
+  let seq = 100
+  const runTurn = async (turn) => {
+    emit({ type: 'turn/start', time: Date.now() - 1000, data: { turn }, seq: seq++ })
+    emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `第${turn}轮` }] }, seq: seq++ })
+    emit({ type: 'turn/end', time: Date.now(), data: { turn, reason: { kind: 'completed' } }, seq: seq++ })
+    await wait(150)
+  }
+  // 轮 50：环境变量清掉后，配置 timeoutSeconds 生效（秒 → 毫秒）
+  streamMode = 'ok'
+  delete process.env.QUIP_TIMEOUT_MS
+  config.timeoutSeconds = 45
+  await runTurn(50)
+  const t50 = await fullTraceOf(50)
+  assert.ok(t50, '50: traced')
+  assert.equal(t50.timeoutMs, 45000, 'timeoutSeconds applies when QUIP_TIMEOUT_MS is absent')
+  assert.equal(t50.timedOut, false, 'a fast turn does not trip the 45 s timeout')
+  // 轮 51：环境变量优先于配置
+  process.env.QUIP_TIMEOUT_MS = '150'
+  await runTurn(51)
+  const t51 = await fullTraceOf(51)
+  assert.ok(t51, '51: traced')
+  assert.equal(t51.timeoutMs, 150, 'QUIP_TIMEOUT_MS overrides timeoutSeconds')
+  assert.equal(t51.timedOut, false)
+  // 轮 52：模型失败 + 兜底关闭 → 无文本可展示，也不写会话日志
+  config.fallback = false
+  streamMode = 'fail'
+  await runTurn(52)
+  const t52 = await fullTraceOf(52)
+  assert.ok(t52, '52: traced')
+  assert.equal(t52.outcome, 'error')
+  assert.equal(t52.source, 'error', 'no text anywhere → source stays error')
+  assert.equal(t52.text, '', 'fallback disabled → nothing is shown')
+  assert.equal(t52.timing.persistMs, null, 'no session-log append was attempted → persistMs stays null')
+  assert.equal(t52.recordSeq, null, 'no session-log append → no seq')
+  assert.equal(fakeSession.calls.map((c) => c.data).find((d) => d?.turn === 52), undefined, 'no session-log record without a shown line')
+  // 离开本块前恢复环境变量与配置快照
+  delete config.timeoutSeconds
+  config.fallback = true
+  streamMode = 'ok'
+  // /status 暴露两个新配置项（恢复后的默认值）
+  {
+    const res = makeRes()
+    await routes.get('/api/quip/v1/status').handler({ url: '/api/quip/v1/status' }, res)
+    const body = JSON.parse(res.body)
+    assert.equal(body.config.timeoutSeconds, 120, 'timeoutSeconds defaults to 120')
+    assert.equal(body.config.redact, true, 'redact defaults to on')
+  }
+}
+
+// ---- 流程 6e：POST /config 写回（timeoutSeconds 校验与夹取） ----
+{
+  const editsBefore = configEdits.length
+  const ok = await postConfig({ config: { timeoutSeconds: 9999, redact: false } })
+  assert.equal(ok.status, 200, 'a numeric timeoutSeconds is accepted')
+  assert.equal(configEdits.at(-1).timeoutSeconds, 600, 'out-of-range values are clamped to 600 before the editor')
+  assert.equal(configEdits.at(-1).redact, false, 'redact passes through to the editor')
+  const bad = await postConfig({ config: { timeoutSeconds: 'abc' } })
+  assert.equal(bad.status, 400, 'a non-numeric timeoutSeconds is rejected')
+  assert.match(bad.body, /timeoutSeconds must be a number/, 'the error names the field')
+  assert.equal(configEdits.length, editsBefore + 1, 'the rejected patch never reaches the config editor')
 }
 
 // ---- 生成记录落盘：按 500 条分文件、只追加不重写、永久保留 ----
@@ -708,8 +1300,11 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
   assert.match(freshName, /^generations-\d{8}-\d{6}\.jsonl$/, 'file name is the first record\'s local time')
   const lines = readFileSync(join(dir, freshName), 'utf8').split('\n').filter(Boolean)
   // 触发生成的轮次：1 2(brand-fail) 3(sse) 6(llm-fail) 7(timeout) 8 9 10 11(empty) 12(finish-error)
-  // 13 14 15(跟随/固定路由) 20(step+1) 21(quoted) 5(rebuild) = 16 条
-  assert.equal(lines.length, 16, 'one generation record per attempted turn, all in the fresh file')
+  // 13 14 15(跟随/固定路由) 20(step+1) 21(quoted) 5(rebuild) = 16 条；
+  // 30–40(流程 6c 结束形态，error/aborted/skip/empty/ok/timeout 等每次尝试都记) = 11 条；
+  // 50 51(超时配置) 52(无兜底失败) = 3 条；
+  // 60 61 62 63 64 65 66(流程 10 素材逐字/思考首尾/百步/脱敏开关) + 80(session-rebuild2 补折) = 8 条，共 38 条
+  assert.equal(lines.length, 38, 'one generation record per attempted turn, all in the fresh file')
   const traces = lines.map((line) => JSON.parse(line))
   // 文件按追加顺序，第一条是 turn 1
   const first = traces[0]
@@ -729,6 +1324,11 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
     assert.deepEqual(
       ['afterSeq', 'file', 'messageId', 'recordSeq', 'step', 'text', 'turnEndSeq'].filter((key) => !(key in trace)),
       [], `every trace carries the locate coordinates: ${JSON.stringify(Object.keys(trace))}`)
+    // 三个终态字段无条件存在：值可以为 null，但键不能缺
+    assert.ok('finishKind' in trace, 'every trace carries finishKind')
+    assert.ok('failure' in trace, 'every trace carries failure')
+    assert.ok('replayState' in trace, 'every trace carries replayState')
+    assert.equal('maxTokens' in trace, false, 'maxTokens is a dead field: dropped from new records too')
   }
   // 写入失败（turn 2 品牌检查失败）的记录：recordSeq 为 null，但 step / messageId 仍在
   const brandFail = traces.find((trace) => trace.turn === 2)
@@ -754,15 +1354,16 @@ await wait(500) // > QUIP_TIMEOUT_MS(150) + 余量
   await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=500' }, after)
   const afterList = JSON.parse(after.body).generations
   assert.equal(afterList.some((entry) => entry.session === 'session-prefill'), false, 'deleted file drops out without a restart')
-  assert.equal(afterList.length, 17, '16 fresh + 1 migrated legacy record')
+  assert.equal(afterList.length, 39, '38 fresh + 1 migrated legacy record')
   const legacy = afterList.find((entry) => entry.session === 'session-legacy')
   assert.equal(legacy.text, '旧格式的最终文本', 'legacy cleaned field is normalised into text on load')
   assert.equal('raw' in legacy, false, 'legacy raw is dropped on load')
+  assert.equal('maxTokens' in legacy, false, 'legacy maxTokens is dropped on load (the disk line keeps it)')
   assert.equal(legacy.file, 'generations-20240601-120000.jsonl', 'legacy record names the migrated file')
   // limit 上限 500：请求 1000 也只给 500
   const capped = makeRes()
   await routes.get('/api/quip/v1/generations').handler({ url: '/api/quip/v1/generations?limit=1000' }, capped)
-  assert.equal(JSON.parse(capped.body).generations.length, 17)
+  assert.equal(JSON.parse(capped.body).generations.length, 39)
 }
 
 // ---- status：暴露记录目录的真实路径（面板「打开记录文件夹」用） ----

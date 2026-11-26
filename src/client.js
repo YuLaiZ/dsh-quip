@@ -63,7 +63,11 @@ window.__ModuleLoader__.load({
         customPrompt: '自定义提示词',
         customPromptHint: '描述这句话的人设与语气，仅在风格为「自定义」时生效。',
         includeReasoning: '素材带上思考过程',
-        includeReasoningHint: '把模型内心的犹豫与绕路（脱敏后）也交给自评模型，生成更贴切；关闭可省输入 token。',
+        includeReasoningHint: '带上本轮第一个和最近一个思考（全文）；关闭可省输入 token。',
+        redact: '素材脱敏',
+        redactHint: '把素材里疑似密钥、token、密码替换为 [redacted] 后再发给模型。关闭后密钥会原样进模型，也会明文写进生成记录。',
+        timeoutSeconds: '生成超时（秒）',
+        timeoutSecondsHint: '超过这个时间没生成完就按超时处理并走兜底。范围 5–600。',
         followSession: '跟随会话模型',
         followSessionHint: '用本会话当前选中的模型生成（含思考等级），与你在输入框上方选的保持一致。',
         model: '生成模型',
@@ -110,6 +114,28 @@ window.__ModuleLoader__.load({
         genLocate: '复制定位命令',
         genCopied: '已复制',
         genCopyFailed: '复制失败，请手动选中复制',
+        genRefreshRecords: '刷新记录',
+        genMaterialRaw: '素材（未脱敏）',
+        genRoute: '路由',
+        genEffort: '思考等级',
+        genEffortsOffered: '模型公布的等级',
+        genRouteSource: '路由来源',
+        genOutcome: '结局',
+        genFinishKind: '结束原因',
+        genNoFinish: '未拿到 finish',
+        genFailure: '失败码',
+        genChunks: 'chunk 数',
+        genTiming: '耗时明细',
+        genTimingLabels: { route: '路由', rebuild: '补折', firstChunk: '首块', firstText: '首字', stream: '流', persist: '写入' },
+        genTimedOut: '已超时（阈值 {ms} ms）',
+        genTimeoutThreshold: '阈值 {ms} ms',
+        genTimeout: '超时',
+        genTurnReason: '轮次结束原因',
+        genContextWindow: '模型窗口',
+        genHostVersion: '宿主版本',
+        genRawText: '输出原文',
+        genReasoning: '俏皮话模型的思考',
+        genConfig: '配置快照',
       },
       en: {
         settingsNav: 'Quip footer',
@@ -121,7 +147,11 @@ window.__ModuleLoader__.load({
         customPrompt: 'Custom prompt',
         customPromptHint: 'Describe the persona and tone; used only when the style is Custom.',
         includeReasoning: 'Include reasoning in material',
-        includeReasoningHint: 'Feed the model\'s own hesitations and detours (redacted) to the self-review call for a sharper line; off saves input tokens.',
+        includeReasoningHint: 'Include the first and the latest reasoning of the turn (full text); off saves input tokens.',
+        redact: 'Redact secrets in material',
+        redactHint: 'Replace suspected keys, tokens and passwords in the material with [redacted] before sending. Off sends them as-is and stores them in plain text in the generation log.',
+        timeoutSeconds: 'Generation timeout (s)',
+        timeoutSecondsHint: 'Give up and fall back after this many seconds. Range 5–600.',
         followSession: 'Follow the session model',
         followSessionHint: 'Generate with the model the session currently uses (including its reasoning effort), matching what you picked above the composer.',
         model: 'Generation model',
@@ -168,6 +198,28 @@ window.__ModuleLoader__.load({
         genLocate: 'Copy locate command',
         genCopied: 'Copied',
         genCopyFailed: 'Copy failed; select and copy manually',
+        genRefreshRecords: 'Refresh records',
+        genMaterialRaw: 'Material (not redacted)',
+        genRoute: 'Route',
+        genEffort: 'Reasoning effort',
+        genEffortsOffered: 'Levels offered',
+        genRouteSource: 'Route source',
+        genOutcome: 'Outcome',
+        genFinishKind: 'Finish reason',
+        genNoFinish: 'no finish chunk',
+        genFailure: 'Failure',
+        genChunks: 'Chunks',
+        genTiming: 'Timing',
+        genTimingLabels: { route: 'route', rebuild: 'rebuild', firstChunk: 'first chunk', firstText: 'first text', stream: 'stream', persist: 'persist' },
+        genTimedOut: 'Timed out (threshold {ms} ms)',
+        genTimeoutThreshold: 'Threshold {ms} ms',
+        genTimeout: 'Timeout',
+        genTurnReason: 'Turn end reason',
+        genContextWindow: 'Context window',
+        genHostVersion: 'Host version',
+        genRawText: 'Raw output',
+        genReasoning: 'Quip model\'s reasoning',
+        genConfig: 'Config snapshot',
       },
     }
 
@@ -627,6 +679,26 @@ window.__ModuleLoader__.load({
       const [folderState, setFolderState] = React.useState('')
       /** 宿主是否能打开本地路径（Remote 探测）。 */
       const [canOpen, setCanOpen] = React.useState(false)
+      // ---- 单条全文：按需请求 + 缓存 + 竞态防护 ----
+      /**
+       * 详情全文缓存：行键 → 完整记录（null = 请求成功但没这条）。放 ref 是为了
+       * 不把大对象挂进 state：写入后只用 detailNonce 触发一次重渲染。
+       */
+      const detailCacheRef = React.useRef(new Map())
+      /** 在途单条请求：行键 → 发起时的代数号；过期回调只清自己的标记，不误删刷新后新请求的。 */
+      const detailInflightRef = React.useRef(new Map())
+      /** 竞态代数号：「刷新记录」清缓存时 +1；返回时代数已变的响应是过期结果，直接丢弃。 */
+      const detailEpochRef = React.useRef(0)
+      /** 面板是否仍挂载：卸载后的回调不再写缓存、不再 setState。 */
+      const aliveRef = React.useRef(true)
+      React.useEffect(() => {
+        aliveRef.current = true
+        return () => { aliveRef.current = false }
+      }, [])
+      /** 单条请求失败过的行键：详情显示失败提示；失败不进缓存，收起再展开即自然重试。 */
+      const [failedDetailKeys, setFailedDetailKeys] = React.useState({})
+      /** 缓存写入计数：作为重渲染信号（缓存本体在 ref 里，state 只记「变过了」）。 */
+      const [, setDetailNonce] = React.useState(0)
 
       React.useEffect(() => {
         let alive = true
@@ -646,9 +718,50 @@ window.__ModuleLoader__.load({
           .catch(() => setFailed(true))
       }, [])
 
+      // 展开即请求：每次从收起变为展开都重新拉列表（旧逻辑只在 records === null
+      // 的首次展开请求）。依赖只留 open：「载入更多」自己带着新 limit 请求，
+      // limit / reload 进依赖会让同一次「载入更多」触发两次请求。
       React.useEffect(() => {
-        if (open && records === null) reload(limit)
-      }, [open, records, limit, reload])
+        if (open) reload(limit)
+      }, [open])
+
+      /** 该行还没有缓存全文时发起单条请求；成功写缓存并重渲染，失败只记失败键。 */
+      const ensureDetail = React.useCallback((record, key) => {
+        if (detailCacheRef.current.has(key) || detailInflightRef.current.has(key)) return
+        const epoch = detailEpochRef.current
+        detailInflightRef.current.set(key, epoch)
+        apiGet(`${API}/generations?session=${encodeURIComponent(String(record.session))}&ts=${encodeURIComponent(String(record.ts))}`)
+          .then((data) => {
+            if (detailInflightRef.current.get(key) === epoch) detailInflightRef.current.delete(key)
+            // 面板已卸载，或「刷新记录」已把缓存清空（代数号变了）：过期结果不写回
+            if (!aliveRef.current || detailEpochRef.current !== epoch) return
+            const full = Array.isArray(data?.generations) ? (data.generations[0] ?? null) : null
+            detailCacheRef.current.set(key, full)
+            setDetailNonce((current) => current + 1)
+          })
+          .catch(() => {
+            if (detailInflightRef.current.get(key) === epoch) detailInflightRef.current.delete(key)
+            if (!aliveRef.current || detailEpochRef.current !== epoch) return
+            setFailedDetailKeys((current) => ({ ...current, [key]: true }))
+          })
+      }, [])
+
+      // 点开的行（含刷新后列表重建）缺全文时按需请求
+      React.useEffect(() => {
+        if (!open || expanded === '' || records === null) return
+        const record = records.find((item) => `${item.ts}:${item.turn}` === expanded)
+        if (record !== undefined) ensureDetail(record, expanded)
+      }, [open, expanded, records, ensureDetail])
+
+      /** 「刷新记录」：清详情缓存（代数号递增作废在途响应、在途标记一并作废）并重新请求列表；
+       * 加载失败时点它就是重试。行仍展开时列表更新会立刻按新代数号重发单条请求。 */
+      const onRefreshRecords = () => {
+        detailCacheRef.current.clear()
+        detailInflightRef.current.clear()
+        detailEpochRef.current += 1
+        setFailedDetailKeys({})
+        reload(limit)
+      }
 
       const onToggle = () => {
         setOpen((current) => !current)
@@ -708,6 +821,90 @@ window.__ModuleLoader__.load({
         const outcomeBadge = record.outcome !== undefined && record.outcome !== 'ok'
           ? h('span', { className: 'qp-gen-badge', 'data-outcome': record.outcome, title: String(record.error ?? '') }, outcomeLabel(record.outcome))
           : null
+        // ---- 详情字段：新契约下列表只带字数，全文（素材/系统提示词/思考等）按需取 ----
+        // 单条全文：按行键查缓存；拿到后与列表字段合并渲染，新字段空值经 genKv/genBlock 自然不渲染
+        const cachedFull = detailCacheRef.current.get(key)
+        const hasFull = cachedFull !== null && cachedFull !== undefined
+        const merged = hasFull ? { ...record, ...cachedFull } : record
+        const isZh = detectLocale() === 'zh'
+        // 全文未到时的占位：失败过（或拿到了但没这条）显示失败提示，否则显示读取中
+        const bigContent = hasFull
+          ? [
+              // 素材标题随脱敏状态变化（旧记录缺 redacted 字段时保持「已脱敏」默认）
+              h('div', { key: 'qp-gen-material' }, genBlock(merged.redacted === false ? tr('genMaterialRaw') : tr('genMaterial'), merged.material)),
+              h('div', { key: 'qp-gen-prompt' }, genBlock(tr('genPrompt'), merged.systemPrompt)),
+            ]
+          : h('span', { className: 'qp-gen-hint' },
+              failedDetailKeys[key] === true || detailCacheRef.current.has(key) ? tr('loadFailed') : tr('loading'))
+        // 思考等级：配置值与实际值不同 → 「auto → high」；否则只显示实际值
+        const configuredEffort = merged.configuredReasoningEffort
+        const actualEffort = merged.reasoningEffort
+        const effortText = configuredEffort !== null && configuredEffort !== undefined
+          && actualEffort !== null && actualEffort !== undefined && configuredEffort !== actualEffort
+          ? `${configuredEffort} → ${actualEffort}`
+          : (actualEffort ?? configuredEffort ?? null)
+        // 模型公布的等级：zh 顿号、en 逗号；provider 有默认等级时追加
+        let offeredText = null
+        if (Array.isArray(merged.effortsOffered) && merged.effortsOffered.length > 0) {
+          offeredText = merged.effortsOffered.join(isZh ? '、' : ', ')
+          if (merged.providerDefaultEffort !== null && merged.providerDefaultEffort !== undefined) {
+            offeredText += isZh ? `，默认 ${merged.providerDefaultEffort}` : `, default ${merged.providerDefaultEffort}`
+          }
+        }
+        const routeText = (merged.provider !== null && merged.provider !== undefined)
+          || (merged.model !== null && merged.model !== undefined)
+          ? `${merged.provider ?? ''}/${merged.model ?? ''}`.replace(/\/$/, '')
+          : null
+        // finishKind：完整记录里键存在但为 null → 没拿到 finish chunk；旧记录键缺失 → 不渲染
+        const finishText = Object.prototype.hasOwnProperty.call(merged, 'finishKind')
+          ? (merged.finishKind !== null && merged.finishKind !== undefined ? merged.finishKind : tr('genNoFinish'))
+          : null
+        // 失败码块：code 一行，message 另起一行（带 status 时追加 HTTP 状态）
+        const failure = merged.failure
+        let failureText = null
+        if (failure !== null && failure !== undefined && typeof failure === 'object') {
+          const lines = []
+          if (failure.code !== null && failure.code !== undefined && failure.code !== '') lines.push(String(failure.code))
+          if (failure.message !== null && failure.message !== undefined && failure.message !== '') {
+            lines.push(String(failure.message)
+              + (failure.status !== null && failure.status !== undefined ? ` · HTTP ${failure.status}` : ''))
+          }
+          if (lines.length > 0) failureText = lines.join('\n')
+        }
+        // 耗时明细：null 项写「-」；补折只在有值时出现
+        let timingText = null
+        if (merged.timing !== null && typeof merged.timing === 'object') {
+          const labels = tr('genTimingLabels')
+          const fmtMs = (label, value) => `${label} ${value === null || value === undefined ? '-' : `${value} ms`}`
+          const parts = [fmtMs(labels.route, merged.timing.routeMs)]
+          if (merged.timing.rebuildMs !== null && merged.timing.rebuildMs !== undefined) {
+            parts.push(`${labels.rebuild} ${merged.timing.rebuildMs} ms`)
+          }
+          parts.push(
+            fmtMs(labels.firstChunk, merged.timing.firstChunkMs),
+            fmtMs(labels.firstText, merged.timing.firstTextMs),
+            fmtMs(labels.stream, merged.timing.streamMs),
+            fmtMs(labels.persist, merged.timing.persistMs))
+          timingText = parts.join(' · ')
+        }
+        const timeoutText = merged.timeoutMs !== null && merged.timeoutMs !== undefined
+          ? tr(merged.timedOut === true ? 'genTimedOut' : 'genTimeoutThreshold', { ms: merged.timeoutMs })
+          : null
+        const contextText = merged.modelContextWindow !== null && merged.modelContextWindow !== undefined
+          ? `${merged.modelContextWindow}`
+            + (merged.modelDefaultMaxTokens !== null && merged.modelDefaultMaxTokens !== undefined
+              ? (isZh ? ` · 默认输出上限 ${merged.modelDefaultMaxTokens}` : ` · default output ${merged.modelDefaultMaxTokens}`)
+              : '')
+          : null
+        const hostText = merged.hostVersion !== null && merged.hostVersion !== undefined
+          ? `${merged.hostVersion}`
+            + (merged.pluginVersion !== null && merged.pluginVersion !== undefined ? ` · plugin ${merged.pluginVersion}` : '')
+          : null
+        const configText = merged.maxChars !== null && merged.maxChars !== undefined
+          ? (isZh
+            ? `字数上限 ${merged.maxChars} · 带思考 ${merged.includeReasoning === false ? '否' : '是'} · 兜底 ${merged.fallbackEnabled === false ? '关' : '开'}`
+            : `max ${merged.maxChars} chars · reasoning ${merged.includeReasoning === false ? 'off' : 'on'} · fallback ${merged.fallbackEnabled === false ? 'off' : 'on'}`)
+          : null
         return h('div', { className: 'qp-gen-item', key },
           h('button', {
             type: 'button', className: 'qp-gen-row', 'aria-expanded': isOpen ? 'true' : 'false',
@@ -740,10 +937,27 @@ window.__ModuleLoader__.load({
                 ? tr('genUsageFull', { in: usage.inputTokens ?? 0, out: usage.outputTokens ?? 0, total: usage.totalTokens ?? ((usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)) })
                 : null),
               genKv(tr('genDurationLabel'), Number.isFinite(record.durationMs) ? tr('genDuration', { ms: record.durationMs }) : null),
+              genKv(tr('genRoute'), routeText, true),
+              genKv(tr('genEffort'), effortText),
+              genKv(tr('genEffortsOffered'), offeredText),
+              genKv(tr('genRouteSource'), merged.routeSource),
+              genKv(tr('genOutcome'), outcomeLabel(merged.outcome)),
+              genKv(tr('genFinishKind'), finishText),
+              genKv(tr('genChunks'), merged.chunks),
+              genKv(tr('genTiming'), timingText),
+              genKv(tr('genTimeout'), timeoutText),
+              genKv(tr('genTurnReason'), merged.turnReason),
+              genKv(tr('genContextWindow'), contextText),
+              genKv(tr('genConfig'), configText),
+              genKv(tr('genHostVersion'), hostText),
               genKv('session', record.session, true)),
-            genBlock(tr('genMaterial'), record.material),
-            genBlock(tr('genPrompt'), record.systemPrompt),
+            // 全文块：未到时占位提示（列表已有的字段已在上面照常渲染）；到货后包一层
+            // div 是为了给数组 children 一个稳定 key
+            bigContent,
+            genBlock(tr('genRawText'), merged.rawText),
+            genBlock(tr('genReasoning'), merged.reasoningText),
             genBlock(tr('genError'), record.error),
+            genBlock(tr('genFailure'), failureText),
             command !== ''
               ? h('div', { className: 'qp-gen-locate' },
                   h('code', { className: 'qp-gen-cmd' }, command),
@@ -755,6 +969,8 @@ window.__ModuleLoader__.load({
           : null)
       }
 
+      /** 「刷新记录」：清缓存重新拉列表；加载失败时点它就是重试。 */
+      const refreshButton = makeButton({ onClick: onRefreshRecords }, tr('genRefreshRecords'))
       const folderButton = makeButton({
         disabled: !openable,
         title: dataDir ?? tr('genOpenFailed'),
@@ -784,7 +1000,13 @@ window.__ModuleLoader__.load({
         return h('div', { className: 'qp-card' },
           h(DisclosureRow, {
             icon: GEN_LIST_ICON, title: tr('genToggle'), open, expandable: true, expandOnRowClick: true,
-            onToggle, headerAccessory: open ? folderButton : null,
+            onToggle,
+            // 包一层 span 并挡冒泡：DisclosureRow 是否接受数组 children 不确定；
+            // 点「刷新记录 / 打开记录文件夹」不应顺手把面板收起
+            headerAccessory: open
+              ? h('span', { className: 'qp-gen-head-actions', role: 'presentation', onClick: (event) => event.stopPropagation() },
+                  refreshButton, folderButton)
+              : null,
           }, body === null && hint === null ? null : h('div', { className: 'qp-gen-body' }, body, hint)))
       }
       return h('div', { className: 'qp-card' },
@@ -795,8 +1017,9 @@ window.__ModuleLoader__.load({
           onKeyDown: (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onToggle() } },
         },
           h('span', { className: 'qp-gen-head-title' }, GEN_LIST_ICON, tr('genToggle')),
-          // 右侧按钮组不冒泡到标题行，否则点「打开记录文件夹」会顺手把面板收起
+          // 右侧按钮组不冒泡到标题行，否则点「刷新记录 / 打开记录文件夹」会顺手把面板收起
           h('div', { className: 'qp-gen-head-actions', role: 'presentation', onClick: (event) => event.stopPropagation() },
+            open ? refreshButton : null,
             open ? folderButton : null,
             h('span', { className: 'qp-gen-chevron', 'data-open': open ? 'true' : undefined, 'aria-hidden': 'true' }, CHEVRON_ICON))),
         body === null && hint === null ? null : h('div', { className: 'qp-gen-body' }, body, hint))
@@ -823,6 +1046,8 @@ window.__ModuleLoader__.load({
             reasoningEffort: data?.config?.reasoningEffort ?? 'auto',
             includeReasoning: data?.config?.includeReasoning !== false,
             followSessionModel: data?.config?.followSessionModel !== false,
+            timeoutSeconds: data?.config?.timeoutSeconds ?? 120,
+            redact: data?.config?.redact !== false,
           })
         }).catch(() => setFailed(true))
       }, [])
@@ -860,6 +1085,9 @@ window.__ModuleLoader__.load({
           reasoningEffort: draft.reasoningEffort ?? 'auto',
           includeReasoning: draft.includeReasoning !== false,
           followSessionModel: draft.followSessionModel !== false,
+          redact: draft.redact !== false,
+          // 数字输入的中间态可能是数字字符串：夹到 5–600 并取整，非法输入落回默认 120
+          timeoutSeconds: Math.min(600, Math.max(5, Math.round(Number(draft.timeoutSeconds) || 120))),
         }
         if (draft.model === 'auto') {
           next.provider = 'auto'
@@ -982,6 +1210,29 @@ window.__ModuleLoader__.load({
               type: 'checkbox', checked: draft.includeReasoning !== false,
               'aria-label': tr('includeReasoning'),
               onChange: (event) => patch({ includeReasoning: event.target.checked }),
+            })),
+          // 脱敏开关：疑似密钥替换成 [redacted] 再发模型；关了会明文进模型与生成记录
+          h('div', { className: 'qp-row' },
+            h('div', { className: 'qp-row-copy' },
+              h('span', null, tr('redact')),
+              h('span', { className: 'qp-hint' }, tr('redactHint'))),
+            h('input', {
+              type: 'checkbox', checked: draft.redact !== false,
+              'aria-label': tr('redact'),
+              onChange: (event) => patch({ redact: event.target.checked }),
+            })),
+          // 生成超时（秒）：超时就按超时处理走兜底；输入中间态允许数字或数字字符串
+          h('div', { className: 'qp-row' },
+            h('div', { className: 'qp-row-copy' },
+              h('span', null, tr('timeoutSeconds')),
+              h('span', { className: 'qp-hint' }, tr('timeoutSecondsHint'))),
+            h('input', {
+              type: 'number', min: 5, max: 600, step: 5,
+              className: 'qp-text', style: { width: '120px' },
+              value: draft.timeoutSeconds,
+              'aria-label': tr('timeoutSeconds'),
+              // 清空输入时保留空串（Number('') 是 0，会把框顶成 0、出现「05」这类中间态）
+              onChange: (event) => patch({ timeoutSeconds: event.target.value === '' ? '' : Number(event.target.value) }),
             })),
           ...customRow,
           h('div', { className: 'qp-divider' }),

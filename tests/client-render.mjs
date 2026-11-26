@@ -25,13 +25,54 @@ dom.window.__ModuleLoader__ = {
   load(def) { loaded = def },
 }
 
-// ---- mock fetch ----
-globalThis.fetch = dom.window.fetch = async (url) => {
-  if (String(url).includes('/status')) {
+// ---- mock fetch：区分 /status、列表 /generations、单条 /generations?ts=、POST /config，并记录每次请求 ----
+const fetchCalls = []
+const postBodies = []
+// 固定 ts：列表与单条返回的必须是同一条记录（Date.now() 每次调用不同会对不上）
+const recordTs = Date.now()
+const rawText = '  （叉腰）稳了\n'
+const reasoningText = '先想想这轮干了啥'
+// 列表记录：新契约不再带 material / systemPrompt 大字段，改为四个字数
+const listRecord = {
+  ts: recordTs, session: 's1', turn: 1, style: 'playful',
+  // 会话日志定位坐标（host 在 record 落盘后回填）
+  step: 8, messageId: 'quip-s1-1-8-abc', recordSeq: 105, afterSeq: 102, turnEndSeq: 104,
+  provider: 'zai-coding-cn', model: 'glm-5.3-flash', reasoningEffort: 'low',
+  // 一个 text 字段 = 用户最终看到的那句（模型原文或兜底句），来源看 source；file = 所属记录文件
+  text: '（叉腰）稳了', file: 'generations-20261124-172100.jsonl', source: 'model',
+  usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+  durationMs: 800, error: null,
+  materialChars: '素材正文'.length, systemPromptChars: '系统提示词'.length,
+  rawTextChars: rawText.length, reasoningTextChars: reasoningText.length,
+}
+// 完整记录 = 列表那条 + 全文与新字段（单条 ?ts= 请求返回）
+const fullRecord = {
+  ...listRecord,
+  material: '素材正文', systemPrompt: '系统提示词',
+  rawText, reasoningText,
+  finishKind: 'stop', failure: null, replayState: null,
+  chunks: 12, timedOut: false, timeoutMs: 120000, turnReason: 'completed',
+  timing: { routeMs: 3, rebuildMs: null, firstChunkMs: 210, firstTextMs: 480, streamMs: 790, persistMs: 2 },
+  configuredReasoningEffort: 'auto', effortsOffered: ['low', 'high'], providerDefaultEffort: 'high',
+  modelContextWindow: 128000, modelDefaultMaxTokens: 8192,
+  maxChars: 64, includeReasoning: true, fallbackEnabled: true,
+  redacted: true, pluginVersion: '0.1.0', hostVersion: '0.2.2-rc.5',
+}
+// 故障注入：只让下一次对应请求失败（各场景块置位，消费一次自动复位）
+let failListOnce = false
+let failDetailOnce = false
+// 竞态钩子：非 null 时下一次带 ts= 的单条请求挂起（json() 等待手动 resolve），只挂一次
+let staleDetailPromise = null
+let staleDetailServed = false
+
+globalThis.fetch = dom.window.fetch = async (url, init) => {
+  const target = String(url)
+  if (target.includes('/status')) {
+    fetchCalls.push(target)
     return {
       ok: true,
       json: async () => ({
-        config: { enabled: true, style: 'playful', customPrompt: '', provider: 'auto', model: 'auto' },
+        config: { enabled: true, style: 'playful', customPrompt: '', provider: 'auto', model: 'auto', timeoutSeconds: 120, redact: true },
         providers: [
           { id: 'zai-coding-cn', name: 'Zai', models: [
             { id: 'glm-5.3', name: 'GLM-5.3', efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }, { id: 'max', name: 'Max' }], defaultEffort: 'max' },
@@ -47,32 +88,36 @@ globalThis.fetch = dom.window.fetch = async (url) => {
       }),
     }
   }
-  if (String(url).includes('/generations')) {
-    return {
-      ok: true,
-      json: async () => ({
-        generations: [{
-          ts: Date.now(), session: 's1', turn: 1, style: 'playful',
-          // 会话日志定位坐标（host 在 record 落盘后回填）
-          step: 8, messageId: 'quip-s1-1-8-abc', recordSeq: 105, afterSeq: 102, turnEndSeq: 104,
-          provider: 'zai-coding-cn', model: 'glm-5.3-flash',
-           material: '素材正文', systemPrompt: '系统提示词',
-          // 一个 text 字段 = 用户最终看到的那句（模型原文或兜底句），来源看 source；file = 所属记录文件
-          text: '（叉腰）稳了', file: 'generations-20261124-172100.jsonl', source: 'model',
-          usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
-          durationMs: 800, error: null,
-        }],
-      }),
-    }
+  if (target.includes('/config') && init?.method === 'POST') {
+    // 记录保存请求的 body：设置卡测试断言写回的 timeoutSeconds / redact
+    fetchCalls.push(target)
+    postBodies.push({ url: target, body: JSON.parse(init.body) })
+    return { ok: true, json: async () => ({ config: postBodies[postBodies.length - 1]?.body?.config ?? {} }) }
   }
-  if (String(url).includes('/quips')) {
+  if (target.includes('/generations')) {
+    fetchCalls.push(target)
+    const ts = new URL(target, 'http://127.0.0.1').searchParams.get('ts')
+    if (ts !== null) {
+      // 单条全文：按 ts 命中才给完整记录（ts 不匹配给空数组，能暴露前端拼错参数）
+      if (failDetailOnce) { failDetailOnce = false; return { ok: false, status: 500, json: async () => ({}) } }
+      // 竞态钩子：第一次命中即挂起，让测试在它仍「在途」时操作刷新
+      if (staleDetailPromise !== null && !staleDetailServed) {
+        staleDetailServed = true
+        return { ok: true, json: async () => await staleDetailPromise }
+      }
+      return { ok: true, json: async () => ({ generations: ts === String(recordTs) ? [fullRecord] : [] }) }
+    }
+    if (failListOnce) { failListOnce = false; return { ok: false, status: 500, json: async () => ({}) } }
+    return { ok: true, json: async () => ({ generations: [listRecord] }) }
+  }
+  if (target.includes('/quips')) {
     // s-empty / s-stale：该轮没有俏皮话（等待态与历史轮次场景）
-    if (/session=s-(empty|stale)/.test(String(url))) {
+    if (/session=s-(empty|stale)/.test(target)) {
       return { ok: true, json: async () => ({ quips: [] }) }
     }
     // s-fallback：v2 兜底句——message.source 是插件 producer kind（不挂模型），
     // 尝试过的路由只在 request 里；悬停明细要标出「兜底池」并仍显示那次路由
-    if (/session=s-fallback/.test(String(url))) {
+    if (/session=s-fallback/.test(target)) {
       return {
         ok: true,
         json: async () => ({
@@ -313,10 +358,12 @@ assert.notEqual(tailEntry.options.id, settingsEntry.options.id, 'tail and settin
   assert.ok([...container.querySelectorAll('button')].some((b) => /刷新|Refresh/.test(b.textContent)), 'refresh is a labelled button')
   assert.ok(afterOpen.includes('（叉腰）稳了'), 'generation record text visible')
 
-  // 点开一条记录详情（素材 / 原始输出）
+  // 点开一条记录详情（素材全文来自单条 ?ts= 请求，点击后等它落地再断言）
   const row = container.querySelector('.qp-gen-row')
   assert.ok(row !== null, 'generation row exists')
   await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
   const detail = container.innerHTML
   assert.ok(detail.includes('素材正文'), 'record detail expanded')
 
@@ -358,6 +405,251 @@ assert.notEqual(tailEntry.options.id, settingsEntry.options.id, 'tail and settin
   await actFn(async () => { copyBtn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
   assert.ok(/复制失败|Copy failed/.test(container.querySelector('.qp-gen-locate button').textContent), 'missing clipboard degrades to a hint')
   root.unmount()
+}
+
+// ---- 新契约：展开即请求、单条全文按需缓存、刷新记录、详情新字段、设置卡新控件 ----
+{
+  fetchCalls.length = 0
+  const container = document.createElement('div')
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  await actFn(async () => { root.render(React.createElement(settingsEntry.component, {})) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+
+  // 设置卡新控件：超时数字输入（初值来自 /status config）与脱敏开关（默认开）
+  const timeoutInput = container.querySelector('input[type="number"][aria-label="生成超时（秒）"]')
+  assert.ok(timeoutInput !== null, 'timeout number input rendered')
+  assert.equal(timeoutInput.value, '120', 'timeout input reflects the status config')
+  assert.equal(timeoutInput.getAttribute('min'), '5', 'timeout input has min=5')
+  assert.equal(timeoutInput.getAttribute('max'), '600', 'timeout input has max=600')
+  const redactToggle = container.querySelector('input[type="checkbox"][aria-label="素材脱敏"]')
+  assert.ok(redactToggle !== null, 'redact toggle rendered')
+  assert.equal(redactToggle.checked, true, 'redact toggle defaults on')
+
+  const listCalls = () => fetchCalls.filter((u) => u.includes('/generations') && !u.includes('ts='))
+  const detailCalls = () => fetchCalls.filter((u) => u.includes('/generations') && u.includes('ts='))
+
+  // 展开面板：列表请求（不带 ts=）恰好 1 次
+  const toggle = container.querySelector('.qp-gen-head[role="button"]')
+  assert.ok(toggle !== null, 'generation toggle row exists')
+  await actFn(async () => { toggle.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(listCalls().length, 1, 'first expand requests the list exactly once')
+
+  // 收起再展开：列表请求共 2 次（展开即请求，不再只在首次展开请求）
+  await actFn(async () => { toggle.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { toggle.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(listCalls().length, 2, 'collapse + expand requests the list again')
+
+  // 「刷新记录」按钮在标题行动作区，与「打开记录文件夹」并列
+  const refreshRecordsBtn = [...container.querySelectorAll('.qp-gen-head-actions .qp-btn')]
+    .find((b) => /刷新记录|Refresh records/.test(b.textContent))
+  assert.ok(refreshRecordsBtn !== undefined, 'refresh-records button sits in the head actions')
+
+  // 点开一行：单条全文请求（带 session 与 ts）恰好 1 次，详情渲染全文与新字段
+  const row = container.querySelector('.qp-gen-row')
+  assert.ok(row !== null, 'generation row exists')
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(detailCalls().length, 1, 'opening a row requests the full record once')
+  assert.ok(detailCalls()[0].includes('session=s1'), 'detail request carries the session: ' + detailCalls()[0])
+  assert.ok(detailCalls()[0].includes(`ts=${recordTs}`), 'detail request carries the record ts: ' + detailCalls()[0])
+  const detailText = container.querySelector('.qp-gen-detail').textContent
+  for (const expected of ['素材正文', '先想想这轮干了啥', '（叉腰）稳了', 'auto → low', 'stop', '0.2.2-rc.5', '128000', '已脱敏']) {
+    assert.ok(detailText.includes(expected), `full detail shows ${expected}: ${detailText.slice(0, 300)}`)
+  }
+
+  // 收起该行再展开：用缓存，单条请求不再增加
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(detailCalls().length, 1, 're-expanding the same row serves the cache')
+  assert.ok(container.querySelector('.qp-gen-detail').textContent.includes('素材正文'), 'cached detail still renders the material')
+
+  // 收起该行，点「刷新记录」：列表 +1；再展开该行：单条 +1（缓存已被清空）
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { refreshRecordsBtn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(listCalls().length, 3, 'refresh records re-requests the list')
+  await actFn(async () => { container.querySelector('.qp-gen-row').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(detailCalls().length, 2, 'cleared cache makes the next expand refetch the full record')
+
+  root.unmount()
+}
+
+// ---- 保存设置：POST body 带上 timeoutSeconds 与 redact ----
+{
+  postBodies.length = 0
+  const container = document.createElement('div')
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  await actFn(async () => { root.render(React.createElement(settingsEntry.component, {})) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  const saveButton = [...container.querySelectorAll('button')].find((b) => b.textContent === '保存')
+  assert.ok(saveButton !== undefined, 'save button found')
+  // 超时输入中间态：清空输入框要保留空串（Number('') 是 0，不能把框顶成 0 再出现「05」）
+  const timeoutInput = container.querySelector('input[type="number"][aria-label="生成超时（秒）"]')
+  assert.ok(timeoutInput !== null, 'timeout input found in the save block')
+  // jsdom + react-dom 18.3 下，text input 的 onChange 事件通路（input/change 派发 +
+  // value tracker 检测）不生效，而 select/checkbox 通路正常；这里直接调用 React 绑定
+  // 的 onChange（等价于 fireEvent，白盒通路），验证处理器的行为而不是平台事件系统
+  const propsKey = Object.keys(timeoutInput).find((k) => k.startsWith('__reactProps$'))
+  assert.ok(propsKey !== undefined, 'react props bound to the timeout input')
+  await actFn(async () => { timeoutInput[propsKey].onChange({ target: { value: '' } }) })
+  assert.equal(timeoutInput.value, '', 'cleared timeout input keeps the empty string mid-state')
+  // 空串点保存：Number('') || 120 落回默认 120
+  await actFn(async () => { saveButton.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(postBodies.length, 1, 'save POST captured once')
+  const sentConfig = postBodies[0]?.body?.config
+  assert.equal(sentConfig?.timeoutSeconds, 120, 'save sends timeoutSeconds')
+  assert.equal(sentConfig?.redact, true, 'save sends redact')
+  root.unmount()
+}
+
+// ---- 列表加载失败 → 失败提示；「刷新记录」就是重试 ----
+{
+  fetchCalls.length = 0
+  failListOnce = true
+  const container = document.createElement('div')
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  await actFn(async () => { root.render(React.createElement(settingsEntry.component, {})) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  const toggle = container.querySelector('.qp-gen-head[role="button"]')
+  await actFn(async () => { toggle.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.ok(container.textContent.includes('读取失败'), 'failed list load shows the failure hint')
+  const refreshRecordsBtn = [...container.querySelectorAll('.qp-gen-head-actions .qp-btn')]
+    .find((b) => /刷新记录|Refresh records/.test(b.textContent))
+  assert.ok(refreshRecordsBtn !== undefined, 'refresh-records button stays available on failure')
+  await actFn(async () => { refreshRecordsBtn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.ok(container.querySelector('.qp-gen-list') !== null, 'retrying via refresh shows the list again')
+  root.unmount()
+}
+
+// ---- 单条全文请求失败 → 详情显示失败提示，不抛错；收起再展开即重试 ----
+{
+  fetchCalls.length = 0
+  failDetailOnce = true
+  const container = document.createElement('div')
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  await actFn(async () => { root.render(React.createElement(settingsEntry.component, {})) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { container.querySelector('.qp-gen-head[role="button"]').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  const row = container.querySelector('.qp-gen-row')
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.ok(container.querySelector('.qp-gen-detail').textContent.includes('读取失败'), 'failed detail shows the failure hint')
+  // 失败不进缓存：收起再展开同一行会重新请求（这次成功）
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.ok(container.querySelector('.qp-gen-detail').textContent.includes('素材正文'), 're-expanding retries and renders the full record')
+  root.unmount()
+}
+
+// ---- 未脱敏记录：素材块标题变为「未脱敏」 ----
+{
+  fullRecord.redacted = false
+  try {
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    await actFn(async () => { root.render(React.createElement(settingsEntry.component, {})) })
+    await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+    await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+    await actFn(async () => { container.querySelector('.qp-gen-head[role="button"]').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+    await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+    await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+    await actFn(async () => { container.querySelector('.qp-gen-row').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+    await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+    await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+    const detailText = container.querySelector('.qp-gen-detail').textContent
+    assert.ok(detailText.includes('素材（未脱敏）'), 'unredacted record labels the material block')
+    assert.ok(!detailText.includes('素材（已脱敏）'), 'redacted label is replaced for unredacted records')
+    root.unmount()
+  } finally {
+    fullRecord.redacted = true
+  }
+}
+
+// ---- 竞态防护：刷新记录后，旧的在途单条响应返回时被代数号丢弃 ----
+{
+  fetchCalls.length = 0
+  staleDetailServed = false
+  let releaseStale
+  staleDetailPromise = new Promise((resolve) => { releaseStale = resolve })
+  const container = document.createElement('div')
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  await actFn(async () => { root.render(React.createElement(settingsEntry.component, {})) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  const listCalls = () => fetchCalls.filter((u) => u.includes('/generations') && !u.includes('ts='))
+  const detailCalls = () => fetchCalls.filter((u) => u.includes('/generations') && u.includes('ts='))
+
+  await actFn(async () => { container.querySelector('.qp-gen-head[role="button"]').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+
+  // 点开一行：第一次单条请求被钩子挂起（在途），详情显示「读取中」
+  const row = container.querySelector('.qp-gen-row')
+  assert.ok(row !== null, 'generation row exists')
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(detailCalls().length, 1, 'stale-gated detail request is in flight')
+  assert.ok(container.querySelector('.qp-gen-detail').textContent.includes('读取中'), 'detail shows loading while the stale request hangs')
+
+  // 行保持展开，点「刷新记录」：列表 +1；在途标记随代数号一并作废 → 该行立刻重发单条请求（第二次，正常返回）
+  const refreshRecordsBtn = [...container.querySelectorAll('.qp-gen-head-actions .qp-btn')]
+    .find((b) => /刷新记录|Refresh records/.test(b.textContent))
+  assert.ok(refreshRecordsBtn !== undefined, 'refresh-records button rendered')
+  await actFn(async () => { refreshRecordsBtn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(listCalls().length, 2, 'refresh records re-requests the list')
+  assert.equal(detailCalls().length, 2, 'refresh invalidates the in-flight marker so the open row refetches')
+  assert.ok(container.querySelector('.qp-gen-detail').textContent.includes('素材正文'), 'the fresh response renders the material')
+
+  // 释放第一次旧 promise：携带内容不同的过期假全文
+  await actFn(async () => { releaseStale({ generations: [{ ...fullRecord, material: '过期结果' }] }) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  const detailText = container.querySelector('.qp-gen-detail').textContent
+  assert.ok(!detailText.includes('过期结果'), 'stale response is dropped by the epoch guard')
+  assert.ok(detailText.includes('素材正文'), 'the fresh material stays rendered after the stale one resolves')
+
+  // 收起再展开该行：缓存里是第二次的结果，不再发请求
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
+  await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(detailCalls().length, 2, 'cache holds the fresh record; re-expand adds no request')
+  assert.ok(container.querySelector('.qp-gen-detail').textContent.includes('素材正文'), 'cached detail keeps the fresh material')
+
+  root.unmount()
+  staleDetailPromise = null
 }
 
 console.log('client jsdom render smoke: ALL OK')

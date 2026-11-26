@@ -1,22 +1,14 @@
 /**
  * 俏皮话的素材工具：事件折叠与脱敏。
  *
- * 「素材」是喂给生成模型的一轮上下文摘要：用户这轮的发言、助手输出的
- * 正文摘要、工具调用统计与轮次时长。全部来自已提交的 `session/event`
- * 流，不回读会话日志；工具**结果**永不进素材（最可能携带文件内容与
- * 环境输出），只有工具名与次数。
+ * 「素材」是喂给生成模型的一轮上下文：用户这轮的发言、助手的回复、工具调用统计与轮次时长。
+ * 全部来自已提交的 `session/event` 流，不回读会话日志；工具**结果**永不进素材（最可能携带
+ * 文件内容与环境输出），只有工具名与次数。
+ *
+ * 用户发言、回复正文、思考过程都**逐字原样**、不做任何字数截断（只去首尾空白，按脱敏开关
+ * 做替换）。思考只取本轮第一条与最后一条非空的：是否带进素材由设置项 `includeReasoning`
+ * 决定（渲染时决定），折叠时两条总是记下。
  */
-
-/** 素材里各片段的截断长度（字）。 */
-const USER_TEXT_LIMIT = 400
-const ASSISTANT_TEXT_LIMIT = 600
-const ASSISTANT_TEXT_PER_STEP_LIMIT = 300
-/**
- * 思考过程的截断长度。思考是「模型绕了什么弯、犹豫了什么」的第一手材料，比正文更能
- * 让自评说得准，给得比正文宽；但它往往冗长且自言自语，仍要封顶以免素材被它淹没。
- */
-const REASONING_TEXT_LIMIT = 800
-const REASONING_TEXT_PER_STEP_LIMIT = 400
 
 /**
  * 脱敏：把疑似密钥 / token / 密码的片段替换为 `[redacted]` 再进素材。
@@ -60,11 +52,16 @@ export function freshTurnMaterial() {
     /** 本轮最后一个 step 号（来自 step/end）；没有 step 事件时为 0。 */
     step: 0,
     startedAt: 0,
+    /** 本轮真人发言全文；多条（含用户中途插话 steer）用换行连接。 */
     userText: '',
-    assistantText: '',
-    reasoningText: '',
+    /** 各步可见正文，按时间：{ step, text }。step 来自 assistant/message 的 data.step，没有则为 null。 */
+    assistantSteps: [],
+    /** 本轮第一条 / 最后一条 trim 后非空的思考：{ step, text }；没有则为 null。 */
+    firstReasoning: null,
+    lastReasoning: null,
     toolCalls: 0,
-    toolNames: [],
+    /** 工具名 → 调用次数，按首次出现的顺序（Map 保持插入序）。 */
+    toolCounts: new Map(),
     steps: 0,
     endedReason: '',
     /**
@@ -84,11 +81,13 @@ export function freshTurnMaterial() {
  * 实际发出去的可见内容）。
  * @param {ReturnType<freshTurnMaterial>} material - 素材累积器。
  * @param {{ type: string, time?: number, data: any }} event - 会话事件。
+ * @param {{ redact?: boolean }} [options] - 脱敏开关，折叠时读取，对之后折叠的事件生效；未传按开处理。
  * @returns {ReturnType<freshTurnMaterial>} 同一素材对象。
  */
-export function foldEvent(material, event) {
+export function foldEvent(material, event, options = {}) {
   if (!event || typeof event.type !== 'string') return material
   const data = event.data ?? {}
+  const clean = options.redact === false ? (text) => text : redactSecrets
   switch (event.type) {
     case 'turn/start':
       material.turn = data.turn ?? material.turn
@@ -98,11 +97,9 @@ export function foldEvent(material, event) {
       // 只收真人输入；runtime-context / goal 等注入不是「用户发言」，
       // 但 steer（用户中途插话）source.kind 是 'user'，会被一并收进来，合理。
       if (data.source && data.source.kind !== 'user') return material
-      const text = redactSecrets(textOf(data.content)).trim()
+      const text = clean(textOf(data.content)).trim()
       if (text === '') return material
-      material.userText = material.userText === ''
-        ? text.slice(0, USER_TEXT_LIMIT)
-        : material.userText + '\n' + text.slice(0, USER_TEXT_LIMIT)
+      material.userText = material.userText === '' ? text : material.userText + '\n' + text
       return material
     }
     case 'assistant/message': {
@@ -112,37 +109,24 @@ export function foldEvent(material, event) {
       if (typeof data.message?.id === 'string' && data.message.id !== '') {
         material.lastAssistantMessageId = data.message.id
       }
-      const content = data.message?.content
-      const text = redactSecrets(textOf(content)).trim()
-      if (text !== '' && material.assistantText.length < ASSISTANT_TEXT_LIMIT) {
-        const chunk = text.slice(0, ASSISTANT_TEXT_PER_STEP_LIMIT)
-        material.assistantText = material.assistantText === ''
-          ? chunk
-          : material.assistantText + '\n' + chunk
-        if (material.assistantText.length > ASSISTANT_TEXT_LIMIT) {
-          material.assistantText = material.assistantText.slice(0, ASSISTANT_TEXT_LIMIT)
-        }
-      }
-      // 思考过程：同样脱敏（它比正文更可能复述文件内容与凭据），按步与总量分别封顶
-      const reasoning = redactSecrets(textOf(content, 'reasoning')).trim()
-      if (reasoning !== '' && material.reasoningText.length < REASONING_TEXT_LIMIT) {
-        const chunk = reasoning.slice(0, REASONING_TEXT_PER_STEP_LIMIT)
-        material.reasoningText = material.reasoningText === ''
-          ? chunk
-          : material.reasoningText + '\n' + chunk
-        if (material.reasoningText.length > REASONING_TEXT_LIMIT) {
-          material.reasoningText = material.reasoningText.slice(0, REASONING_TEXT_LIMIT)
-        }
+      const step = Number.isSafeInteger(data.step) ? data.step : null
+      // 正文全文原样（只去首尾空白）
+      const text = clean(textOf(data.message?.content)).trim()
+      if (text !== '') material.assistantSteps.push({ step, text })
+      // 思考：同样按开关脱敏（它比正文更可能复述文件内容与凭据）；只记第一条与最后一条非空的
+      const reasoning = clean(textOf(data.message?.content, 'reasoning')).trim()
+      if (reasoning !== '') {
+        const entry = { step, text: reasoning }
+        // 第一条只在还没有时记；最后一条每条都覆盖
+        if (material.firstReasoning === null) material.firstReasoning = entry
+        material.lastReasoning = entry
       }
       return material
     }
     case 'tool/call': {
       material.toolCalls += 1
       const name = typeof data.name === 'string' ? data.name : ''
-      if (name !== '' && !material.toolNames.includes(name)) {
-        // 保留去重后的工具名清单，最多记 8 个
-        if (material.toolNames.length < 8) material.toolNames.push(name)
-      }
+      if (name !== '') material.toolCounts.set(name, (material.toolCounts.get(name) ?? 0) + 1)
       return material
     }
     case 'step/end':
@@ -159,34 +143,47 @@ export function foldEvent(material, event) {
 }
 
 /**
- * 素材是否值得生成：完全空轮（用户没说话且助手没输出）跳过。
+ * 素材是否值得生成：完全空轮（用户没说话、助手没输出、没调工具）跳过。
  * @param {ReturnType<freshTurnMaterial>} material - 折叠后的素材。
  * @returns {boolean} 值得生成。
  */
 export function materialWorthQuip(material) {
-  return material.userText !== '' || material.assistantText !== ''
-    || material.reasoningText !== '' || material.toolCalls > 0
+  return material.userText !== '' || material.assistantSteps.length > 0
+    || material.firstReasoning !== null || material.toolCalls > 0
+}
+
+/** 「第 N 步：正文」；没有步号时只有正文。 */
+function stepLabel(step, text) {
+  return step === null ? text : `第 ${step} 步：${text}`
 }
 
 /**
- * 把素材渲染成给生成模型的用户消息正文。
+ * 把素材渲染成给生成模型的用户消息正文。各段逐字原样，不做任何截断。
  * @param {ReturnType<freshTurnMaterial>} material - 折叠后的素材。
- * @param {{ includeReasoning?: boolean }} [options] - 是否带上思考过程。
+ * @param {{ includeReasoning?: boolean }} [options] - 是否带上思考过程（首尾两条全文）。
  * @returns {string} 素材正文。
  */
 export function renderMaterial(material, options = {}) {
   const lines = []
-  lines.push(`【本轮用户发言摘要】\n${material.userText === '' ? '（无文本，可能是命令或附件触发）' : material.userText}`)
-  lines.push(`【本轮助手输出摘要】\n${material.assistantText === '' ? '（无可见文本输出）' : material.assistantText}`)
-  if (options.includeReasoning !== false) {
-    lines.push(`【本轮助手思考过程摘录（模型内心的犹豫、绕路与自我纠正；自评时可以引用）】\n${material.reasoningText === '' ? '（本轮无思考过程）' : material.reasoningText}`)
-  }
+  lines.push(`【本轮用户发言】\n${material.userText === '' ? '（无文本，可能是命令或附件触发）' : material.userText}`)
+  const reply = material.assistantSteps.length === 0
+    ? '（无可见文本输出）'
+    : material.assistantSteps.map((item) => stepLabel(item.step, item.text)).join('\n')
+  lines.push(`【本轮助手回复】\n${reply}`)
   const tools = material.toolCalls === 0
     ? '（未调用工具）'
-    : `共 ${material.toolCalls} 次：${material.toolNames.join('、')}${material.toolCalls > material.toolNames.length ? ' 等' : ''}`
+    : `共 ${material.toolCalls} 次：${[...material.toolCounts].map(([name, count]) => `${name}×${count}`).join('、')}`
   lines.push(`【本轮工具使用】${tools}`)
   const seconds = material.startedAt > 0 ? Math.max(1, Math.round((Date.now() - material.startedAt) / 1000)) : 0
   lines.push(`【本轮耗时】约 ${seconds} 秒，${material.steps} 次模型步骤，结束原因 ${material.endedReason || 'completed'}`)
+  if (options.includeReasoning !== false) {
+    const first = material.firstReasoning
+    const last = material.lastReasoning
+    const body = first === null
+      ? '（本轮无思考过程）'
+      : (first === last ? stepLabel(first.step, first.text) : `${stepLabel(first.step, first.text)}\n${stepLabel(last.step, last.text)}`)
+    lines.push(`【本轮助手思考过程（模型内心的犹豫、绕路与自我纠正；自评时可以引用）】\n${body}`)
+  }
   lines.push('请依据以上素材，按系统指令输出一句话。')
   return lines.join('\n\n')
 }
