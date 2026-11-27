@@ -338,7 +338,7 @@ window.__ModuleLoader__.load({
       '.qp-gen-row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
       '.qp-gen-row:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));',
       'outline-offset:-2px}',
-      '.qp-gen-when{flex:none;width:38px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
+      '.qp-gen-when{flex:none;width:84px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
       '.qp-gen-file{flex:0 1 120px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
       'color:var(--dsw-alias-label-quaternary, var(--dsw-alias-label-tertiary));',
       'font-family:var(--dsh-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);font-size:11px}',
@@ -618,6 +618,17 @@ window.__ModuleLoader__.load({
       return Number.isFinite(date.getTime())
         ? `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
         : ''
+    }
+
+    /**
+     * MM-dd HH:mm：生成记录列表的时间列。记录跨天保存，只显示时分时，昨天 18:36 会排在
+     * 今天 15:56 之后，看起来像乱序——所以带上月日。
+     */
+    function whenOf(ts) {
+      const date = new Date(ts)
+      if (!Number.isFinite(date.getTime())) return ''
+      const pad = (value) => String(value).padStart(2, '0')
+      return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
     }
 
     /** 紧凑键值网格里的一行（dt + dd）；空值不渲染。 */
@@ -912,7 +923,7 @@ window.__ModuleLoader__.load({
             title: (String(record.provider ?? '?') + '/' + String(record.model ?? '')).replace(/\/$/, ''),
             onClick: () => { setExpanded(isOpen ? '' : key) },
           },
-            h('span', { className: 'qp-gen-when' }, clockOf(record.ts)),
+            h('span', { className: 'qp-gen-when' }, whenOf(record.ts)),
             record.file ? h('span', { className: 'qp-gen-file', title: filePath ?? record.file }, fileLabel(record.file)) : null,
             h('span', { className: 'qp-gen-model', title: `${record.provider ?? ''}/${record.model ?? ''}` },
               `${record.provider ?? record.request?.provider ?? '?'}/${record.model ?? record.request?.model ?? ''}`.replace(/\/$/, '')),

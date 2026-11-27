@@ -28,8 +28,9 @@ dom.window.__ModuleLoader__ = {
 // ---- mock fetch：区分 /status、列表 /generations、单条 /generations?ts=、POST /config，并记录每次请求 ----
 const fetchCalls = []
 const postBodies = []
-// 固定 ts：列表与单条返回的必须是同一条记录（Date.now() 每次调用不同会对不上）
-const recordTs = Date.now()
+// 固定 ts：列表与单条返回的必须是同一条记录（Date.now() 每次调用不同会对不上）。
+// 取本地时间 2026-09-05 08:07——月、日、时、分都小于 10，时间列的补零漏了就会露馅
+const recordTs = new Date(2026, 8, 5, 8, 7).getTime()
 const rawText = '  （叉腰）稳了\n'
 const reasoningText = '先想想这轮干了啥'
 // 列表记录：新契约不再带 material / systemPrompt 大字段，改为四个字数
@@ -361,6 +362,8 @@ assert.notEqual(tailEntry.options.id, settingsEntry.options.id, 'tail and settin
   // 点开一条记录详情（素材全文来自单条 ?ts= 请求，点击后等它落地再断言）
   const row = container.querySelector('.qp-gen-row')
   assert.ok(row !== null, 'generation row exists')
+  // 时间列带月日（MM-dd HH:mm）：跨天的记录只看时分像乱序；夹具的月、日、时、分都小于 10，验证补零
+  assert.equal(row.querySelector('.qp-gen-when')?.textContent ?? '', '09-05 08:07', 'list time column shows MM-dd HH:mm with zero padding')
   await actFn(async () => { row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) })
   await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
   await actFn(async () => { await new Promise((resolve) => setImmediate(resolve)) })
